@@ -1,0 +1,1 @@
+initSidebarItems({"fn":[["emit_dwarf",""],["read_debuginfo",""],["write_debugsections",""],["write_debugsections_image",""]],"struct":[["DebugInfoData",""],["DwarfSection",""],["WasmFileInfo",""]]});
