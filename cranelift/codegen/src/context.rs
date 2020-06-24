@@ -13,6 +13,7 @@ use crate::binemit::{
     relax_branches, shrink_instructions, CodeInfo, MemoryCodeSink, RelocSink, StackmapSink,
     TrapSink,
 };
+use crate::blade::do_blade;
 use crate::dce::do_dce;
 use crate::dominator_tree::DominatorTree;
 use crate::flowgraph::ControlFlowGraph;
@@ -193,6 +194,18 @@ impl Context {
             if opt_level == OptLevel::SpeedAndSize {
                 self.shrink_instructions(isa)?;
             }
+
+            // We do Blade last. That way, it sees all possible loads and stores, including spills/unspills.
+            //
+            // We could consider doing Blade before regalloc.  The argument from Swivel for this is as follows:
+            // Blade doesn't need to consider register unspills as dangerous loads.
+            // Register unspills can't have their address controlled by the attacker, so they
+            // can't directly produce dangerous transient data;
+            // and if transient data was stored there by a previous speculative register spill,
+            // then even the pre-regalloc blade pass will see the def-use chain across the spill-unspill
+            // and insert a fence or SLH somewhere in the chain.
+            self.blade(isa)?;
+
             let result = self.relax_branches(isa);
 
             debug!("Compiled:\n{}", self.func.display(isa));
@@ -415,6 +428,12 @@ impl Context {
         self.verify_if(isa)?;
         self.verify_locations_if(isa)?;
         Ok(info)
+    }
+
+    /// Perform the Blade pass to insert lfences in appropriate places.
+    pub fn blade(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
+        do_blade(&mut self.func, &self.cfg, isa.flags().blade());
+        self.verify_if(isa)
     }
 
     /// Builds ranges and location for specified value labels.

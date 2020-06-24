@@ -399,6 +399,7 @@ emit_all_ones_funcaddrs = false
 enable_probestack = true
 probestack_func_adjusts_sp = false
 enable_jump_tables = true
+blade = "none"
 "#
         );
         assert_eq!(f.opt_level(), super::OptLevel::None);
