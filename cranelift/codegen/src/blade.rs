@@ -89,13 +89,13 @@ fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_setting: set
                     ),
                 }
             }
-            ValueDef::Param(ebb, _) => {
+            ValueDef::Param(block, _) => {
                 // cut at this value by putting lfence at beginning of
-                // the `ebb`, that is, before the first instruction
+                // the `block`, that is, before the first instruction
                 let first_inst = func
                     .layout
-                    .first_inst(ebb)
-                    .expect("ebb has no instructions");
+                    .first_inst(block)
+                    .expect("block has no instructions");
                 func.pre_lfence[first_inst] = true;
             }
         },
@@ -139,13 +139,13 @@ fn insert_fence_after(func: &mut Function, bnode: BladeNode, blade_setting: sett
                     ),
                 }
             }
-            ValueDef::Param(ebb, _) => {
+            ValueDef::Param(block, _) => {
                 // cut at this value by putting lfence at beginning of
-                // the `ebb`, that is, before the first instruction
+                // the `block`, that is, before the first instruction
                 let first_inst = func
                     .layout
-                    .first_inst(ebb)
-                    .expect("ebb has no instructions");
+                    .first_inst(block)
+                    .expect("block has no instructions");
                 func.pre_lfence[first_inst] = true;
             }
         },
@@ -387,7 +387,7 @@ fn build_blade_graph_for_func(func: &mut Function, cfg: &ControlFlowGraph) -> Bl
                 bladenode_to_node_map.insert(BladeNode::Sink(inst), inst_sink_node);
                 // blade only does conditional branches but this will handle indirect jumps as well
                 // `inst_fixed_args` gets the condition args for branches,
-                //   and ignores destination the ebb params (which are also included in args)
+                //   and ignores the destination block params (which are also included in args)
                 for value in func.dfg.inst_fixed_args(inst) {
                     let value_node = bladenode_to_node_map[&BladeNode::ValueDef(*value)];
                     gg.add_edge(value_node, inst_sink_node);
