@@ -18,7 +18,7 @@ pub fn do_blade(func: &mut Function, cfg: &ControlFlowGraph, blade_setting: sett
         return;
     }
 
-    let blade_graph = build_blade_graph_for_func(func, cfg);
+    let blade_graph = build_blade_graph_for_func(func, cfg, true);
 
     let cut_edges = blade_graph.min_cut();
 
@@ -277,9 +277,9 @@ enum ValueUse {
 struct BladeGraph {
     /// the actual graph
     graph: LinkedListGraph<usize>,
-    /// the (single) source node
+    /// the (single) source node. there are edges from this to sources
     source_node: Node<usize>,
-    /// the (single) sink node
+    /// the (single) sink node. there are edges from sinks to this
     sink_node: Node<usize>,
     /// maps graph nodes to the `BladeNode`s which they correspond to
     node_to_bladenode_map: HashMap<Node<usize>, BladeNode>,
@@ -318,20 +318,95 @@ impl BladeGraph {
     }
 }
 
-fn build_blade_graph_for_func(func: &mut Function, cfg: &ControlFlowGraph) -> BladeGraph {
-    let mut gg = LinkedListGraph::<usize>::new_builder();
-    let mut node_to_bladenode_map = HashMap::new();
-    let mut bladenode_to_node_map = HashMap::new();
-    let source = gg.add_node(); // edges from this to sources
-    let sink = gg.add_node(); // sinks have edges to this
+struct BladeGraphBuilder {
+    /// builder for the actual graph
+    graph: <LinkedListGraph<usize> as rs_graph::Buildable>::Builder,
+    /// the (single) source node
+    source_node: Node<usize>,
+    /// the (single) sink node
+    sink_node: Node<usize>,
+    /// maps graph nodes to the `BladeNode`s which they correspond to
+    node_to_bladenode_map: HashMap<Node<usize>, BladeNode>,
+    /// maps `BladeNode`s to the graph nodes which they correspond to
+    bladenode_to_node_map: HashMap<BladeNode, Node<usize>>,
+}
 
-    // first we add nodes for all possible values, and populate our maps accordingly
-    for val in func.dfg.values() {
-        let node = gg.add_node();
-        node_to_bladenode_map.insert(node, BladeNode::ValueDef(val));
-        bladenode_to_node_map.insert(BladeNode::ValueDef(val), node);
+impl BladeGraphBuilder {
+    /// Creates a new `BladeGraphBuilder` with the `node_to_bladenode_map` and
+    /// `bladenode_to_node_map` populated for all `Value`s in the `Function`
+    fn with_nodes_for_func(func: &Function) -> Self {
+        let mut gg = LinkedListGraph::<usize>::new_builder();
+        let mut node_to_bladenode_map = HashMap::new();
+        let mut bladenode_to_node_map = HashMap::new();
+        let source_node = gg.add_node();
+        let sink_node = gg.add_node();
+
+        // add nodes for all values in the function, and populate our maps accordingly
+        for val in func.dfg.values() {
+            let node = gg.add_node();
+            node_to_bladenode_map.insert(node, BladeNode::ValueDef(val));
+            bladenode_to_node_map.insert(BladeNode::ValueDef(val), node);
+        }
+
+        Self {
+            graph: gg,
+            source_node,
+            sink_node,
+            node_to_bladenode_map,
+            bladenode_to_node_map,
+        }
     }
-    // from this point on, we can assume that `bladenode_to_node_map` is valid for all Values
+
+    /// Mark the given `Value` as a source.
+    fn mark_as_source(&mut self, src: Value) {
+        let node = self.bladenode_to_node_map[&BladeNode::ValueDef(src)];
+        self.graph.add_edge(self.source_node, node);
+    }
+
+    /// Add an edge from the given `Node` to the given `Value`
+    fn add_edge_from_node_to_value(&mut self, from: Node<usize>, to: Value) {
+        let value_node = self.bladenode_to_node_map[&BladeNode::ValueDef(to)];
+        self.graph.add_edge(from, value_node);
+    }
+
+    /// Add an edge from the given `Value` to the given `Node`
+    fn add_edge_from_value_to_node(&mut self, from: Value, to: Node<usize>) {
+        let value_node = self.bladenode_to_node_map[&BladeNode::ValueDef(from)];
+        self.graph.add_edge(value_node, to);
+    }
+
+    /// Add a new sink node for the given `inst`
+    fn add_sink_node_for_inst(&mut self, inst: Inst) -> Node<usize> {
+        let inst_sink_node = self.graph.add_node();
+        self.node_to_bladenode_map.insert(inst_sink_node, BladeNode::Sink(inst));
+        self.bladenode_to_node_map.insert(BladeNode::Sink(inst), inst_sink_node);
+        self.graph.add_edge(inst_sink_node, self.sink_node);
+        inst_sink_node
+    }
+
+    /// Consumes the `BladeGraphBuilder`, generating a `BladeGraph`
+    fn build(self) -> BladeGraph {
+        BladeGraph {
+            graph: self.graph.to_graph(),
+            source_node: self.source_node,
+            sink_node: self.sink_node,
+            node_to_bladenode_map: self.node_to_bladenode_map,
+            _bladenode_to_node_map: self.bladenode_to_node_map,
+        }
+    }
+}
+
+/// `store_values_are_sinks`: if `true`, then the value operand to a store
+/// instruction is considered a sink. if `false`, it is not.
+/// For instance in the instruction "store x to addrA", if
+/// `store_values_are_sinks` is `true`, then both `x` and `addrA` are sinks,
+/// but if it is `false`, then just `addrA` is a sink.
+fn build_blade_graph_for_func(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    store_values_are_sinks: bool,
+) -> BladeGraph {
+    let mut builder = BladeGraphBuilder::with_nodes_for_func(func);
 
     // find sources and sinks, and add edges to/from our global source and sink nodes
     for block in func.layout.blocks() {
@@ -343,63 +418,57 @@ fn build_blade_graph_for_func(func: &mut Function, cfg: &ControlFlowGraph) -> Bl
                 // except for fills, which don't have sinks
 
                 // handle load as a source
-                let loaded_val = func.dfg.first_result(inst); // assume that there is only one result
-                let loaded_val_node = bladenode_to_node_map[&BladeNode::ValueDef(loaded_val)];
-                gg.add_edge(source, loaded_val_node);
+                for &result in func.dfg.inst_results(inst) {
+                    builder.mark_as_source(result);
+                }
 
                 // handle load as a sink, except for fills
                 if !(op == Opcode::Fill || op == Opcode::FillNop) {
-                    let inst_sink_node = gg.add_node();
-                    node_to_bladenode_map.insert(inst_sink_node, BladeNode::Sink(inst));
-                    bladenode_to_node_map.insert(BladeNode::Sink(inst), inst_sink_node);
+                    let inst_sink_node = builder.add_sink_node_for_inst(inst);
                     // for each address component variable of inst,
                     // add edge address_component_variable_node -> sink
                     // XXX X86Pop has an implicit dependency on %rsp which is not captured here
-                    for arg_val in func.dfg.inst_args(inst) {
-                        let arg_node = bladenode_to_node_map[&BladeNode::ValueDef(*arg_val)];
-                        gg.add_edge(arg_node, inst_sink_node);
+                    for &arg in func.dfg.inst_args(inst) {
+                        builder.add_edge_from_value_to_node(arg, inst_sink_node);
                     }
-                    gg.add_edge(inst_sink_node, sink);
                 }
 
             } else if op.can_store() {
                 // loads are both sources and sinks, but stores are just sinks
 
-                let inst_sink_node = gg.add_node();
-                node_to_bladenode_map.insert(inst_sink_node, BladeNode::Sink(inst));
-                bladenode_to_node_map.insert(BladeNode::Sink(inst), inst_sink_node);
-                // similar to for loop above, but should skip the value being stored
-                // SC: as far as I can tell, all stores (that have arguments) always
-                //   have the value being stored as the first argument
-                //   and everything after is address args
+                let inst_sink_node = builder.add_sink_node_for_inst(inst);
+                // similar to the load case above, but special treatment for the value being stored
                 // XXX X86Push has an implicit dependency on %rsp which is not captured here
-                for arg_val in func.dfg.inst_args(inst).iter().skip(1) {
-                    let arg_node = bladenode_to_node_map[&BladeNode::ValueDef(*arg_val)];
-                    gg.add_edge(arg_node, inst_sink_node);
-                }
-                gg.add_edge(inst_sink_node, sink);
+                if store_values_are_sinks {
+                    for &arg in func.dfg.inst_args(inst) {
+                        builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                    }
+                } else {
+                    // SC: as far as I can tell, all stores (that have arguments) always
+                    //   have the value being stored as the first argument
+                    //   and everything after is address args
+                    for &arg in func.dfg.inst_args(inst).iter().skip(1) { // skip the first argument
+                        builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                    }
+                };
 
             } else if op.is_branch() {
                 // conditional branches are sinks
 
-                let inst_sink_node = gg.add_node();
-                node_to_bladenode_map.insert(inst_sink_node, BladeNode::Sink(inst));
-                bladenode_to_node_map.insert(BladeNode::Sink(inst), inst_sink_node);
+                let inst_sink_node = builder.add_sink_node_for_inst(inst);
+
                 // blade only does conditional branches but this will handle indirect jumps as well
                 // `inst_fixed_args` gets the condition args for branches,
                 //   and ignores the destination block params (which are also included in args)
-                for value in func.dfg.inst_fixed_args(inst) {
-                    let value_node = bladenode_to_node_map[&BladeNode::ValueDef(*value)];
-                    gg.add_edge(value_node, inst_sink_node);
+                for &arg in func.dfg.inst_fixed_args(inst) {
+                    builder.add_edge_from_value_to_node(arg, inst_sink_node);
                 }
-                gg.add_edge(inst_sink_node, sink);
 
             }
             if op.is_call() {
-                // call instruction: must assume that the return value could be a source
-                for result in func.dfg.inst_results(inst) {
-                    let result_node = bladenode_to_node_map[&BladeNode::ValueDef(*result)];
-                    gg.add_edge(source, result_node);
+                // call instruction: must assume that the return value(s) could be a source
+                for &result in func.dfg.inst_results(inst) {
+                    builder.mark_as_source(result);
                 }
             }
         }
@@ -410,10 +479,9 @@ fn build_blade_graph_for_func(func: &mut Function, cfg: &ControlFlowGraph) -> Bl
         .layout
         .entry_block()
         .expect("Failed to find entry block");
-    for func_param in func.dfg.block_params(entry_block) {
+    for &func_param in func.dfg.block_params(entry_block) {
         // parameters of the entry block == parameters of the function
-        let param_node = bladenode_to_node_map[&BladeNode::ValueDef(*func_param)];
-        gg.add_edge(source, param_node);
+        builder.mark_as_source(func_param);
     }
 
     // now add edges for actual data dependencies
@@ -424,32 +492,24 @@ fn build_blade_graph_for_func(func: &mut Function, cfg: &ControlFlowGraph) -> Bl
     // we have z -> sink and source -> x, but need x -> z yet
     let def_use_graph = DefUseGraph::for_function(func, cfg);
     for val in func.dfg.values() {
-        let node = bladenode_to_node_map[&BladeNode::ValueDef(val)]; // must exist
+        let node = builder.bladenode_to_node_map[&BladeNode::ValueDef(val)]; // must exist
         for val_use in def_use_graph.uses_of_val(val) {
             match *val_use {
                 ValueUse::Inst(inst_use) => {
                     // add an edge from val to the result of inst_use
                     // TODO this assumes that all results depend on all operands;
                     // are there any instructions where this is not the case for our purposes?
-                    for result in func.dfg.inst_results(inst_use) {
-                        let result_node = bladenode_to_node_map[&BladeNode::ValueDef(*result)]; // must exist
-                        gg.add_edge(node, result_node);
+                    for &result in func.dfg.inst_results(inst_use) {
+                        builder.add_edge_from_node_to_value(node, result);
                     }
                 }
                 ValueUse::Value(val_use) => {
                     // add an edge from val to val_use
-                    let val_use_node = bladenode_to_node_map[&BladeNode::ValueDef(val_use)]; // must exist
-                    gg.add_edge(node, val_use_node);
+                    builder.add_edge_from_node_to_value(node, val_use);
                 }
             }
         }
     }
 
-    BladeGraph {
-        graph: gg.to_graph(),
-        source_node: source,
-        sink_node: sink,
-        node_to_bladenode_map,
-        _bladenode_to_node_map: bladenode_to_node_map,
-    }
+    builder.build()
 }
