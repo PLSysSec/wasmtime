@@ -16,6 +16,8 @@ mod recipes;
 mod registers;
 mod settings;
 
+pub(crate) use opcodes::LFENCE as LFENCE_BYTES;
+
 pub(crate) fn define(shared_defs: &mut SharedDefinitions) -> TargetIsa {
     let settings = settings::define(&shared_defs.settings);
     let regs = registers::define();

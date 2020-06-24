@@ -159,6 +159,9 @@ pub static JUMP_SHORT_IF_OVERFLOW: [u8; 1] = [0x70];
 /// Store effective address for m in register r{16,32,64}.
 pub static LEA: [u8; 1] = [0x8d];
 
+/// Lfence
+pub static LFENCE: [u8; 3] = [0x0f, 0xae, 0xe8];
+
 /// Count the number of leading zero bits.
 pub static LZCNT: [u8; 3] = [0xf3, 0x0f, 0xbd];
 

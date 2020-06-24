@@ -61,6 +61,12 @@ pub struct Function {
     /// Illegal instructions have the `Encoding::default()` value.
     pub encodings: InstEncodings,
 
+    /// Whether to use lfence before the instruction.
+    pub pre_lfence: SecondaryMap<Inst, bool>,
+
+    /// Whether to use lfence after the instruction.
+    pub post_lfence: SecondaryMap<Inst, bool>,
+
     /// Location assigned to every value.
     pub locations: ValueLocations,
 
@@ -119,6 +125,8 @@ impl Function {
             dfg: DataFlowGraph::new(),
             layout: Layout::new(),
             encodings: SecondaryMap::new(),
+            pre_lfence: SecondaryMap::new(),
+            post_lfence: SecondaryMap::new(),
             locations: SecondaryMap::new(),
             entry_diversions: EntryRegDiversions::new(),
             offsets: SecondaryMap::new(),

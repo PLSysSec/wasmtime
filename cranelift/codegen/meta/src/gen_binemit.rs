@@ -7,6 +7,42 @@ use crate::srcgen::Formatter;
 
 use crate::cdsl::recipes::{EncodingRecipe, OperandConstraint, Recipes};
 
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref LFENCE_BYTES: String = {
+        let mut string = String::from("[");
+        for b in crate::isa::x86::LFENCE_BYTES.iter() {
+            string.push_str(&format!("{:#x}, ", b));
+        }
+        string.push(']');
+        string
+    };
+}
+
+fn write_an_lfence(fmt: &mut Formatter) {
+    let mut line = String::from("for &b in ");
+    line.push_str(&LFENCE_BYTES);
+    line.push_str(".iter() {{ sink.put1(b); }}");
+    fmt.line(&line);
+}
+
+fn do_pre_lfence(fmt: &mut Formatter) {
+    fmt.line("if func.pre_lfence[inst] {");
+    fmt.indent(|fmt| {
+        write_an_lfence(fmt);
+    });
+    fmt.line("}");
+}
+
+fn do_post_lfence(fmt: &mut Formatter) {
+    fmt.line("if func.post_lfence[inst] {");
+    fmt.indent(|fmt| {
+        write_an_lfence(fmt);
+    });
+    fmt.line("}");
+}
+
 /// Generate code to handle a single recipe.
 ///
 /// - Unpack the instruction data, knowing the format.
@@ -85,6 +121,7 @@ fn gen_recipe(recipe: &EncodingRecipe, fmt: &mut Formatter) {
         match &recipe.emit {
             Some(emit) => {
                 fmt.multi_line(emit);
+                do_post_lfence(fmt);
                 fmt.line("return;");
             }
             None => {
@@ -187,6 +224,9 @@ fn gen_isa(isa_name: &str, recipes: &Recipes, fmt: &mut Formatter) {
         fmt.line("let encoding = func.encodings[inst];");
         fmt.line("let bits = encoding.bits();");
         fmt.line("let inst_data = &func.dfg[inst];");
+
+        do_pre_lfence(fmt);
+
         fmt.line("match encoding.recipe() {");
         fmt.indent(|fmt| {
             for (i, recipe) in recipes.iter() {
@@ -200,6 +240,8 @@ fn gen_isa(isa_name: &str, recipes: &Recipes, fmt: &mut Formatter) {
             fmt.line("_ => {},");
         });
         fmt.line("}");
+
+        do_post_lfence(fmt);
 
         // Allow for unencoded ghost instructions. The verifier will check details.
         fmt.line("if encoding.is_legal() {");

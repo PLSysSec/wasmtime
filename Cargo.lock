@@ -392,6 +392,7 @@ version = "0.62.0"
 dependencies = [
  "cranelift-codegen-shared",
  "cranelift-entity",
+ "lazy_static",
 ]
 
 [[package]]

@@ -40,6 +40,8 @@ use crate::CodegenResult;
 use core::convert::TryFrom;
 use log::debug;
 
+const LFENCE_SIZE_IN_BYTES: u32 = 3;
+
 /// Relax branches and compute the final layout of block headers in `func`.
 ///
 /// Fill in the `func.offsets` table so the function is ready for binary emission.
@@ -102,20 +104,29 @@ pub fn relax_branches(
 
                 let enc = cur.func.encodings[inst];
 
+                if cur.func.pre_lfence[inst] {
+                    offset += LFENCE_SIZE_IN_BYTES;
+                }
+
                 // See if this is a branch has a range and a destination, and if the target is in
                 // range.
                 if let Some(range) = encinfo.branch_range(enc) {
                     if let Some(dest) = cur.func.dfg[inst].branch_destination() {
                         let dest_offset = cur.func.offsets[dest];
                         if !range.contains(offset, dest_offset) {
-                            offset +=
-                                relax_branch(&mut cur, &divert, offset, dest_offset, &encinfo, isa);
-                            continue;
+                            relax_branch(&mut cur, &divert, offset, dest_offset, &encinfo, isa);
                         }
                     }
                 }
 
-                offset += encinfo.byte_size(enc, inst, &divert, &cur.func);
+                // get enc again as it may be updated in relax_branch
+                let enc = cur.func.encodings[inst];
+                let inst_size = encinfo.byte_size(enc, inst, &divert, &cur.func);
+                offset += inst_size;
+
+                if cur.func.post_lfence[inst] {
+                    offset += LFENCE_SIZE_IN_BYTES;
+                }
             }
         }
     }
