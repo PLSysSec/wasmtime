@@ -77,6 +77,7 @@ impl WasmToObjCommand {
             self.common.debug_info,
             self.output.clone(),
             &cache_config,
+            &self.common.blade,
         )?;
 
         // FIXME: Make the format a parameter.

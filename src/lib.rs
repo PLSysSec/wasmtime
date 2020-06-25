@@ -144,6 +144,10 @@ struct CommonOptions {
     #[structopt(short = "O", long)]
     optimize: bool,
 
+    /// Blade flags, passed on to Cranelift
+    #[structopt(long, default_value="none")]
+    blade: String,
+
     /// Optimization level for generated functions (0 (none), 1, 2 (most), or s
     /// (size))
     #[structopt(
@@ -167,7 +171,8 @@ impl CommonOptions {
             .wasm_threads(self.enable_threads || self.enable_all)
             .cranelift_opt_level(self.opt_level())
             .strategy(pick_compilation_strategy(self.cranelift, self.lightbeam)?)?
-            .profiler(pick_profiling_strategy(self.jitdump, self.vtune)?)?;
+            .profiler(pick_profiling_strategy(self.jitdump, self.vtune)?)?
+            .blade(&self.blade)?;
         if !self.disable_cache {
             match &self.config {
                 Some(path) => {

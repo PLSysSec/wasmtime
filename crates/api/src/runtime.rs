@@ -385,6 +385,12 @@ impl Config {
         self.memory_creator = Some(MemoryCreatorProxy { mem_creator });
         self
     }
+
+    /// Sets the Blade setting to be passed on to Cranelift
+    pub fn blade(&mut self, blade: impl AsRef<str>) -> Result<&mut Self> {
+        self.flags.set("blade", blade.as_ref())?; // blade.as_ref().parse().expect("Failed to parse blade setting");
+        Ok(self)
+    }
 }
 
 impl Default for Config {

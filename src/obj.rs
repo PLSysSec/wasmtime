@@ -23,6 +23,7 @@ pub fn compile_to_obj(
     debug_info: bool,
     artifact_name: String,
     cache_config: &CacheConfig,
+    blade: impl AsRef<str>,
 ) -> Result<Artifact> {
     let isa_builder = match target {
         Some(target) => native::lookup(target.clone())?,
@@ -48,6 +49,8 @@ pub fn compile_to_obj(
         }
         other => bail!("unknown optimization level {:?}", other),
     }
+
+    flag_builder.set("blade", blade.as_ref()).unwrap();
 
     let isa = isa_builder.finish(settings::Flags::new(flag_builder));
 
