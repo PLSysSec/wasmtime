@@ -472,11 +472,21 @@ fn build_blade_graph_for_func(
                 for &result in func.dfg.inst_results(inst) {
                     builder.mark_as_source(result);
                 }
+
+                // and, to avoid interprocedural analysis, we require that
+                // function arguments are stable, so we mark arguments to a call
+                // as sinks
+                let inst_sink_node = builder.add_sink_node_for_inst(inst);
+                for &arg in func.dfg.inst_args(inst) {
+                    builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                }
             }
         }
     }
 
-    // add edges to mark function parameters as potentially transient
+    // we no longer mark function parameters as transient, since we require that
+    // they are stable on the caller side (so this is commented)
+    /*
     let entry_block = func
         .layout
         .entry_block()
@@ -485,6 +495,7 @@ fn build_blade_graph_for_func(
         // parameters of the entry block == parameters of the function
         builder.mark_as_source(func_param);
     }
+    */
 
     // now add edges for actual data dependencies
     // for instance in the following pseudocode:
