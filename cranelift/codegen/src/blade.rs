@@ -260,7 +260,7 @@ impl DefUseGraph {
         func.dfg
             .inst_results(inst)
             .iter()
-            .map(move |val| self.uses_of_val(*val))
+            .map(move |&val| self.uses_of_val(val))
             .flatten()
     }
 }
@@ -378,8 +378,10 @@ impl BladeGraphBuilder {
     /// Add a new sink node for the given `inst`
     fn add_sink_node_for_inst(&mut self, inst: Inst) -> Node<usize> {
         let inst_sink_node = self.graph.add_node();
-        self.node_to_bladenode_map.insert(inst_sink_node, BladeNode::Sink(inst));
-        self.bladenode_to_node_map.insert(BladeNode::Sink(inst), inst_sink_node);
+        self.node_to_bladenode_map
+            .insert(inst_sink_node, BladeNode::Sink(inst));
+        self.bladenode_to_node_map
+            .insert(BladeNode::Sink(inst), inst_sink_node);
         self.graph.add_edge(inst_sink_node, self.sink_node);
         inst_sink_node
     }
