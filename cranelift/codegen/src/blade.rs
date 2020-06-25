@@ -63,7 +63,18 @@ pub fn do_blade(func: &mut Function, cfg: &ControlFlowGraph, blade_setting: sett
                     );
                 }
             }
-            settings::Blade::Slh => unimplemented!("SLH"),
+            settings::Blade::Slh => {
+                if edge_src == blade_graph.source_node {
+                    // source -> n : apply SLH to the instruction that produces n
+                    do_slh_on(func, blade_graph.node_to_bladenode_map[&edge_snk].clone());
+                } else if edge_snk == blade_graph.sink_node {
+                    // n -> sink : uh oh (n will be a sink instruction, we need to SLH on the source)
+                    unimplemented!()
+                } else {
+                    // n -> m : apply SLH to the instruction that produces n
+                    do_slh_on(func, blade_graph.node_to_bladenode_map[&edge_src].clone());
+                }
+            }
             settings::Blade::None => panic!("Shouldn't reach here with Blade setting None"),
         }
     }
@@ -190,6 +201,16 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst) {
     }
 }
 
+fn do_slh_on(func: &mut Function, bnode: BladeNode) {
+    match bnode {
+        BladeNode::Sink(_) => panic!("Can't do SLH on a sink"),
+        BladeNode::ValueDef(value) => {
+            let _bounds = func.dfg.bounds[value].as_ref().expect("Trying to do SLH on a value which isn't a pointer");
+            unimplemented!()
+        }
+    }
+}
+
 struct DefUseGraph {
     /// Maps a value to its uses
     map: SecondaryMap<Value, Vec<ValueUse>>,
@@ -214,11 +235,6 @@ impl DefUseGraph {
             // Also, mark each block parameter as a use of the corresponding argument
             // in all branch instructions which can feed this block
             for incoming_bb in cfg.pred_iter(block) {
-                // TODO: is `incoming_bb.inst` actually the appropriate
-                // branch instruction which can branch here? Or is it just
-                // the final instruction in the block? In Cranelift IR, blocks
-                // (EBBs) can have multiple branch instructions scattered
-                // throughout.
                 let incoming_branch = &func.dfg[incoming_bb.inst];
                 let branch_args = match incoming_branch {
                     InstructionData::Branch { .. }

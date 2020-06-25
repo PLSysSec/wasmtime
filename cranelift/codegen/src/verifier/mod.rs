@@ -600,6 +600,37 @@ impl<'a> Verifier<'a> {
             ));
         }
 
+        // Blade: load and store instructions must have bounds information on at
+        // least one address argument
+        let opcode = inst_data.opcode();
+        if opcode.can_load() {
+            if opcode == Opcode::Fill || opcode == Opcode::FillNop || opcode == Opcode::Regfill {
+                // fills are exempt from this check
+            } else {
+                let mut address_args = dfg.inst_args(inst).iter(); // all args are address args
+                if !address_args.any(|&arg| dfg.bounds[arg].is_some()) {
+                    return errors.fatal((
+                        inst,
+                        self.context(inst),
+                        "Blade: Load instruction has no argument marked as pointer",
+                    ));
+                }
+            }
+        } else if opcode.can_store() {
+            if opcode == Opcode::Spill || opcode == Opcode::Regspill {
+                // spills are exempt from this check
+            } else {
+                let mut address_args = dfg.inst_args(inst).iter().skip(1); // first arg is store value
+                if !address_args.any(|&arg| dfg.bounds[arg].is_some()) {
+                    return errors.fatal((
+                        inst,
+                        self.context(inst),
+                        "Blade: Store instruction has no argument marked as pointer",
+                    ))
+                }
+            }
+        }
+
         self.verify_entity_references(inst, errors)
     }
 

@@ -59,6 +59,10 @@ pub struct DataFlowGraph {
     /// Primary value table with entries for all values.
     values: PrimaryMap<Value, ValueData>,
 
+    /// Bounds information attached to each `Value`.
+    /// Non-pointer `Value`s have `None` here.
+    pub bounds: SecondaryMap<Value, Option<Bounds>>,
+
     /// Function signature table. These signatures are referenced by indirect call instructions as
     /// well as the external function references.
     pub signatures: PrimaryMap<SigRef, Signature>,
@@ -88,6 +92,7 @@ impl DataFlowGraph {
             blocks: PrimaryMap::new(),
             value_lists: ValueListPool::new(),
             values: PrimaryMap::new(),
+            bounds: SecondaryMap::new(),
             signatures: PrimaryMap::new(),
             old_signatures: SecondaryMap::new(),
             ext_funcs: PrimaryMap::new(),
@@ -104,6 +109,7 @@ impl DataFlowGraph {
         self.blocks.clear();
         self.value_lists.clear();
         self.values.clear();
+        self.bounds.clear();
         self.signatures.clear();
         self.old_signatures.clear();
         self.ext_funcs.clear();
@@ -426,6 +432,24 @@ enum ValueData {
     /// An alias value can't be linked as an instruction result or block parameter. It is used as a
     /// placeholder when the original instruction or block has been rewritten or modified.
     Alias { ty: Type, original: Value },
+}
+
+/// Bounds information attached to a (pointer) value.
+#[derive(Clone, Debug)]
+pub struct Bounds {
+    /// Lower bound on the value.
+    pub lower: Value,
+
+    /// Upper bound on the value.
+    pub upper: Value,
+
+    /// `true` if these bounds come directly from an annotation.
+    /// `false` if these bounds come because this value is derived from another
+    /// value with bounds.
+    /// This distinction matters for when dynamic changes are made to the DFG --
+    /// we can recompute all bounds information starting only from directly
+    /// annotated values.
+    pub directly_annotated: bool,
 }
 
 /// Instructions.

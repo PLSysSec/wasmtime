@@ -104,6 +104,7 @@ mod num_uses;
 mod partition_slice;
 mod postopt;
 mod predicates;
+mod propagate_bounds;
 mod redundant_reload_remover;
 mod regalloc;
 mod result;

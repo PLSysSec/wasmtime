@@ -26,6 +26,7 @@ use crate::loop_analysis::LoopAnalysis;
 use crate::machinst::MachCompileResult;
 use crate::nan_canonicalization::do_nan_canonicalization;
 use crate::postopt::do_postopt;
+use crate::propagate_bounds::propagate_bounds;
 use crate::redundant_reload_remover::RedundantReloadRemover;
 use crate::regalloc;
 use crate::result::CodegenResult;
@@ -204,6 +205,7 @@ impl Context {
             // and if transient data was stored there by a previous speculative register spill,
             // then even the pre-regalloc blade pass will see the def-use chain across the spill-unspill
             // and insert a fence or SLH somewhere in the chain.
+            self.propagate_bounds(isa)?;
             self.blade(isa)?;
 
             let result = self.relax_branches(isa);
@@ -428,6 +430,12 @@ impl Context {
         self.verify_if(isa)?;
         self.verify_locations_if(isa)?;
         Ok(info)
+    }
+
+    /// Run a pass to propagate bounds information
+    pub fn propagate_bounds(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
+        propagate_bounds(&mut self.func);
+        self.verify_if(isa)
     }
 
     /// Perform the Blade pass to insert lfences in appropriate places.
