@@ -12,7 +12,7 @@ use rs_graph::maxflow::MaxFlow;
 use rs_graph::traits::Directed;
 use rs_graph::Buildable;
 use rs_graph::Builder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 
@@ -40,6 +40,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
     let cut_edges = blade_graph.min_cut();
 
     // insert the fences / SLHs
+    let mut slh_ctx = SLHContext::new();
     for cut_edge in cut_edges {
         let edge_src = blade_graph.graph.src(cut_edge);
         let edge_snk = blade_graph.graph.snk(cut_edge);
@@ -83,17 +84,17 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
             settings::Blade::Slh => {
                 if edge_src == blade_graph.source_node {
                     // source -> n : apply SLH to the instruction that produces n
-                    do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&edge_snk].clone());
+                    slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&edge_snk].clone());
                 } else if edge_snk == blade_graph.sink_node {
                     // n -> sink : for SLH we can't cut at n (which is a sink instruction), we have
                     // to trace back through the graph and cut at all sources which lead to n
                     for node in blade_graph.ancestors_of(edge_src) {
-                        do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone());
+                        slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone());
                     }
                 } else {
                     // n -> m : likewise, apply SLH to all sources which lead to n
                     for node in blade_graph.ancestors_of(edge_src) {
-                        do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone());
+                        slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone());
                     }
                 }
             }
@@ -227,9 +228,28 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst) {
     }
 }
 
-/// TODO: We should ensure somehow that calling this function for a second time
-/// on the same `BladeNode` has no effect.
-fn do_slh_on(func: &mut Function, isa: &dyn TargetIsa, bnode: BladeNode) {
+struct SLHContext {
+    /// tracks which `BladeNode`s have already had SLH applied to them
+    bladenodes_done: HashSet<BladeNode>,
+}
+
+impl SLHContext {
+    /// A blank SLHContext
+    fn new() -> Self {
+        Self {
+            bladenodes_done: HashSet::new(),
+        }
+    }
+
+    /// Do SLH on `bnode`, but only if we haven't already done SLH on `bnode`
+    fn do_slh_on(&mut self, func: &mut Function, isa: &dyn TargetIsa, bnode: BladeNode) {
+        if self.bladenodes_done.insert(bnode.clone()) {
+            _do_slh_on(func, isa, bnode);
+        }
+    }
+}
+
+fn _do_slh_on(func: &mut Function, isa: &dyn TargetIsa, bnode: BladeNode) {
     match bnode {
         BladeNode::Sink(_) => panic!("Can't do SLH to protect a sink, have to protect a source"),
         BladeNode::ValueDef(value) => {
