@@ -1,8 +1,10 @@
 //! A pass over Cranelift IR which implements the Blade algorithm
 
+use crate::cursor::{Cursor, EncCursor};
 use crate::entity::SecondaryMap;
 use crate::flowgraph::ControlFlowGraph;
-use crate::ir::{Function, Inst, InstructionData, Opcode, Value, ValueDef};
+use crate::ir::{condcodes::IntCC, dfg::Bounds, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef};
+use crate::isa::TargetIsa;
 use crate::settings;
 use rs_graph::linkedlistgraph::{Edge, LinkedListGraph, Node};
 use rs_graph::maxflow::pushrelabel::PushRelabel;
@@ -11,11 +13,26 @@ use rs_graph::traits::Directed;
 use rs_graph::Buildable;
 use rs_graph::Builder;
 use std::collections::HashMap;
-use std::vec::Vec;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
 
-pub fn do_blade(func: &mut Function, cfg: &ControlFlowGraph, blade_setting: settings::Blade) {
+/// If this is `true`, then Blade will use a fake bound information for any
+/// address which does not have associated bounds information.
+pub(crate) const ALLOW_FAKE_SLH_BOUNDS: bool = true;
+
+/// Nonsense array length (in bytes) to use as the fake bound information (see
+/// `ALLOW_FAKE_SLH_BOUNDS` above)
+pub(crate) const FAKE_SLH_ARRAY_LENGTH_BYTES: u32 = 2345;
+
+const DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER: bool = false;
+
+pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph, blade_setting: settings::Blade) {
     if blade_setting == settings::Blade::None {
         return;
+    }
+
+    if DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER {
+        println!("Function before blade:\n{}", func.display(isa));
     }
 
     let blade_graph = build_blade_graph_for_func(func, cfg, true);
@@ -66,17 +83,26 @@ pub fn do_blade(func: &mut Function, cfg: &ControlFlowGraph, blade_setting: sett
             settings::Blade::Slh => {
                 if edge_src == blade_graph.source_node {
                     // source -> n : apply SLH to the instruction that produces n
-                    do_slh_on(func, blade_graph.node_to_bladenode_map[&edge_snk].clone());
+                    do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&edge_snk].clone());
                 } else if edge_snk == blade_graph.sink_node {
-                    // n -> sink : uh oh (n will be a sink instruction, we need to SLH on the source)
-                    unimplemented!()
+                    // n -> sink : for SLH we can't cut at n (which is a sink instruction), we have
+                    // to trace back through the graph and cut at all sources which lead to n
+                    for node in blade_graph.ancestors_of(edge_src) {
+                        do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone());
+                    }
                 } else {
-                    // n -> m : apply SLH to the instruction that produces n
-                    do_slh_on(func, blade_graph.node_to_bladenode_map[&edge_src].clone());
+                    // n -> m : likewise, apply SLH to all sources which lead to n
+                    for node in blade_graph.ancestors_of(edge_src) {
+                        do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone());
+                    }
                 }
             }
             settings::Blade::None => panic!("Shouldn't reach here with Blade setting None"),
         }
+    }
+
+    if DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER {
+        println!("Function after blade:\n{}", func.display(isa));
     }
 }
 
@@ -201,12 +227,66 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst) {
     }
 }
 
-fn do_slh_on(func: &mut Function, bnode: BladeNode) {
+/// TODO: We should ensure somehow that calling this function for a second time
+/// on the same `BladeNode` has no effect.
+fn do_slh_on(func: &mut Function, isa: &dyn TargetIsa, bnode: BladeNode) {
     match bnode {
-        BladeNode::Sink(_) => panic!("Can't do SLH on a sink"),
+        BladeNode::Sink(_) => panic!("Can't do SLH to protect a sink, have to protect a source"),
         BladeNode::ValueDef(value) => {
-            let _bounds = func.dfg.bounds[value].as_ref().expect("Trying to do SLH on a value which isn't a pointer");
-            unimplemented!()
+            // The value that needs protecting is `value`, so we need to apply SLH to the load which produced `value`
+            match func.dfg.value_def(value) {
+                ValueDef::Param(_, _) => unimplemented!("SLH on a block parameter"),
+                ValueDef::Result(inst, _) => {
+                    assert!(func.dfg[inst].opcode().can_load(), "SLH on a non-load instruction: {:?}", func.dfg[inst]);
+                    let mut cur = EncCursor::new(func, isa).at_inst(inst);
+                    // Find the arguments to `inst` which are marked as pointers / have bounds
+                    // (as pairs (argnum, argvalue))
+                    let mut pointer_args = cur.func.dfg.inst_args(inst).iter().copied().enumerate().filter(|&(_, arg)| cur.func.dfg.bounds[arg].is_some());
+                    let (pointer_arg_num, pointer_arg, bounds) = match pointer_args.next() {
+                        Some((num, arg)) => match pointer_args.next() {
+                            Some(_) => panic!("SLH: multiple pointer args found to instruction {:?}", func.dfg[inst]),
+                            None => {
+                                // all good, there is exactly one pointer arg
+                                let bounds = cur.func.dfg.bounds[arg].clone().expect("we already checked that there's bounds here");
+                                (num, arg, bounds)
+                            }
+                        }
+                        None => {
+                            if ALLOW_FAKE_SLH_BOUNDS {
+                                let pointer_arg_num = 0; // we pick the first arg, arbitrarily
+                                let pointer_arg = cur.func.dfg.inst_args(inst)[pointer_arg_num];
+                                let lower = pointer_arg;
+                                let upper = cur.ins().iadd_imm(pointer_arg, (FAKE_SLH_ARRAY_LENGTH_BYTES as u64) as i64);
+                                let bounds = Bounds {
+                                    lower,
+                                    upper,
+                                    directly_annotated: false,
+                                };
+                                (pointer_arg_num, pointer_arg, bounds)
+                            } else {
+                                panic!("SLH: no pointer arg found for instruction {:?}", func.dfg[inst])
+                            }
+                        }
+                    };
+                    let masked_pointer = {
+                        let pointer_ty = cur.func.dfg.value_type(pointer_arg);
+                        let zero = cur.ins().iconst(pointer_ty, 0);
+                        let all_ones = cur.ins().iconst(pointer_ty, -1);
+                        let flags = cur.ins().ifcmp(pointer_arg, bounds.lower);
+                        let mask = cur.ins().selectif(pointer_ty, IntCC::UnsignedGreaterThanOrEqual, flags, all_ones, zero);
+                        let op_size_bytes = {
+                            let bytes = cur.func.dfg.value_type(value).bytes() as u64;
+                            cur.ins().iconst(pointer_ty, bytes as i64)
+                        };
+                        let adjusted_upper_bound = cur.ins().isub(bounds.upper, op_size_bytes);
+                        let flags = cur.ins().ifcmp(pointer_arg, adjusted_upper_bound);
+                        let mask = cur.ins().selectif(pointer_ty, IntCC::UnsignedLessThanOrEqual, flags, mask, zero);
+                        cur.ins().band(pointer_arg, mask)
+                    };
+                    // now update the original load instruction to use the masked pointer instead
+                    cur.func.dfg.inst_args_mut(inst)[pointer_arg_num] = masked_pointer;
+                }
+            }
         }
     }
 }
@@ -331,6 +411,29 @@ impl BladeGraph {
             .filter(|(_, dst)| !reachable_from_source.contains(dst))
             .map(|(edge, _)| edge)
             .collect()
+    }
+
+    /// Given a `Node`, iterate over all of the "source nodes" which have paths
+    /// to it, where "source node" is defined by `self.is_source_node`.
+    ///
+    /// If the given `node` is itself a "source node", we'll just return `node` itself
+    fn ancestors_of<'s>(&'s self, node: Node<usize>) -> Box<dyn Iterator<Item = Node<usize>> + 's> {
+        if self.is_source_node(node) {
+            Box::new(std::iter::once(node))
+        } else {
+            Box::new(
+                self.graph.inedges(node)
+                    .map(move |(_, incoming)| self.ancestors_of(incoming))
+                    .flatten()
+            )
+        }
+    }
+
+    /// Is the given `Node` a "source node" in the graph, where "source node" is
+    /// here defined as any node which has an edge from the global source node to
+    /// it
+    fn is_source_node(&self, node: Node<usize>) -> bool {
+        self.graph.inedges(node).any(|(_, incoming)| incoming == self.source_node)
     }
 }
 

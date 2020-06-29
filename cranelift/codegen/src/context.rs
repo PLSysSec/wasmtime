@@ -451,7 +451,7 @@ impl Context {
 
     /// Perform the Blade pass to insert lfences in appropriate places.
     pub fn blade(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
-        do_blade(&mut self.func, &self.cfg, isa.flags().blade());
+        do_blade(&mut self.func, isa, &self.cfg, isa.flags().blade());
         self.verify_if(isa)
     }
 
