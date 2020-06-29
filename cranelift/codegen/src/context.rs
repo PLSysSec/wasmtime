@@ -188,6 +188,20 @@ impl Context {
             Ok(info)
         } else {
             self.branch_splitting(isa)?;
+            // Doing Blade here -- after the CFG is finalized but before regalloc -- allows us to use
+            // constructs (in particular for SLH) which require temp registers from the register
+            // allocator.
+            //
+            // I tentatively claim that it is safe to do Blade here both for Lfence and SLH strategies:
+            // Blade doesn't need to consider register unspills as dangerous loads. Register unspills
+            // can't have their address controlled by the attacker, so they can't directly produce
+            // dangerous transient data; and if transient data was stored there by a previous
+            // speculative register spill, then even the pre-regalloc Blade will see the def-use chain
+            // across the spill-unspill (which is invisible prior to regalloc) and either (1) insert a
+            // fence somewhere in the chain, or (2) apply SLH to the initial load in the chain.
+            self.propagate_bounds(isa)?;
+            self.blade(isa)?;
+
             self.regalloc(isa)?;
             self.prologue_epilogue(isa)?;
             if opt_level == OptLevel::Speed || opt_level == OptLevel::SpeedAndSize {
@@ -196,18 +210,6 @@ impl Context {
             if opt_level == OptLevel::SpeedAndSize {
                 self.shrink_instructions(isa)?;
             }
-
-            // We do Blade last. That way, it sees all possible loads and stores, including spills/unspills.
-            //
-            // We could consider doing Blade before regalloc.  The argument from Swivel for this is as follows:
-            // Blade doesn't need to consider register unspills as dangerous loads.
-            // Register unspills can't have their address controlled by the attacker, so they
-            // can't directly produce dangerous transient data;
-            // and if transient data was stored there by a previous speculative register spill,
-            // then even the pre-regalloc blade pass will see the def-use chain across the spill-unspill
-            // and insert a fence or SLH somewhere in the chain.
-            self.propagate_bounds(isa)?;
-            self.blade(isa)?;
 
             let result = self.relax_branches(isa);
 
