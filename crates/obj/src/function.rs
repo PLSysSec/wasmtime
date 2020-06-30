@@ -4,6 +4,7 @@ use object::{RelocationEncoding, RelocationKind, SymbolFlags, SymbolKind, Symbol
 use wasmtime_environ::entity::EntityRef;
 use wasmtime_environ::settings;
 use wasmtime_environ::settings::Configurable;
+use wasmtime_environ::wasm::FuncIndex;
 use wasmtime_environ::{Compilation, Module, RelocationTarget, Relocations};
 
 /// Defines module functions
@@ -13,7 +14,7 @@ pub fn declare_functions(
     relocations: &Relocations,
 ) -> Result<()> {
     for i in 0..module.local.num_imported_funcs {
-        let string_name = format!("_wasm_function_{}", i);
+        let string_name = wasm_function_name(module, &FuncIndex::new(i));
         let _symbol_id = obj.add_symbol(Symbol {
             name: string_name.as_bytes().to_vec(),
             value: 0,
@@ -27,7 +28,7 @@ pub fn declare_functions(
     }
     for (i, _function_relocs) in relocations.iter().rev() {
         let func_index = module.local.func_index(i);
-        let string_name = format!("_wasm_function_{}", func_index.index());
+        let string_name = wasm_function_name(module, &func_index);
         let _symbol_id = obj.add_symbol(Symbol {
             name: string_name.as_bytes().to_vec(),
             value: 0,
@@ -63,7 +64,7 @@ pub fn emit_functions(
     for (i, _function_relocs) in relocations.iter() {
         let body = &compilation.get(i).body;
         let func_index = module.local.func_index(i);
-        let string_name = format!("_wasm_function_{}", func_index.index());
+        let string_name = wasm_function_name(module, &func_index);
 
         let symbol_id = obj.symbol_id(string_name.as_bytes()).unwrap();
         let section_id = obj.section_id(StandardSection::Text);
@@ -73,7 +74,7 @@ pub fn emit_functions(
 
     for (i, function_relocs) in relocations.iter() {
         let func_index = module.local.func_index(i);
-        let string_name = format!("_wasm_function_{}", func_index.index());
+        let string_name = wasm_function_name(module, &func_index);
         let symbol_id = obj.symbol_id(string_name.as_bytes()).unwrap();
         let (_, section_offset) = obj.symbol_section_and_offset(symbol_id).unwrap();
         let section_id = obj.section_id(StandardSection::Text);
@@ -81,7 +82,7 @@ pub fn emit_functions(
             debug_assert_eq!(r.addend, 0);
             match r.reloc_target {
                 RelocationTarget::UserFunc(target_index) => {
-                    let target_name = format!("_wasm_function_{}", target_index.index());
+                    let target_name = wasm_function_name(module, &target_index);
                     let target_symbol = obj.symbol_id(target_name.as_bytes()).unwrap();
                     obj.add_relocation(
                         section_id,
@@ -104,4 +105,8 @@ pub fn emit_functions(
     }
 
     Ok(())
+}
+
+fn wasm_function_name(module: &Module, func_index: &FuncIndex) -> String {
+    module.func_names.get(func_index).cloned().unwrap_or_else(|| format!("_wasm_function_{}", func_index.index()))
 }
