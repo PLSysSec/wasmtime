@@ -434,15 +434,27 @@ impl BladeGraph {
     }
 
     /// Given a `Node`, iterate over all of the "source nodes" which have paths
-    /// to it, where "source node" is defined by `BladeGraph::is_source_node`.
+    /// to it, where "source node" is defined by `self.is_source_node`.
     ///
     /// If the given `node` is itself a "source node", we'll just return `node` itself
     fn ancestors_of(&self, node: Node<usize>) -> HashSet<Node<usize>> {
-        let mut ancestors = AncestorsOf {
-            blade_graph: self,
-            seen_nodes: HashSet::new(),
-        };
-        ancestors.ancestors_of(node)
+        self._ancestors_of(node, &mut HashSet::new())
+    }
+
+    fn _ancestors_of(&self, node: Node<usize>, seen_nodes: &mut HashSet<Node<usize>>) -> HashSet<Node<usize>> {
+        if !seen_nodes.insert(node) {
+            // we've already processed this node and all its ancestors
+            return HashSet::new();
+        }
+        if self.is_source_node(node) {
+            HashSet::from_iter(std::iter::once(node))
+        } else {
+            let mut hs = HashSet::new();
+            for (_, incoming) in self.graph.inedges(node) {
+                hs.extend(self._ancestors_of(incoming, seen_nodes))
+            }
+            hs
+        }
     }
 
     /// Is the given `Node` a "source node" in the graph, where "source node" is
@@ -450,33 +462,6 @@ impl BladeGraph {
     /// it
     fn is_source_node(&self, node: Node<usize>) -> bool {
         self.graph.inedges(node).any(|(_, incoming)| incoming == self.source_node)
-    }
-}
-
-struct AncestorsOf<'a> {
-    blade_graph: &'a BladeGraph,
-    seen_nodes: HashSet<Node<usize>>,
-}
-
-impl<'a> AncestorsOf<'a> {
-    /// Given a `Node`, get the set of all the "source nodes" which have paths
-    /// to it, where "source node" is defined by `BladeGraph::is_source_node`.
-    ///
-    /// If the given `node` is itself a "source node", we'll just return `node` itself
-    fn ancestors_of(&mut self, node: Node<usize>) -> HashSet<Node<usize>> {
-        if !self.seen_nodes.insert(node) {
-            // we've already processed this node and all its ancestors
-            return HashSet::new();
-        }
-        if self.blade_graph.is_source_node(node) {
-            HashSet::from_iter(std::iter::once(node))
-        } else {
-            let mut hs = HashSet::new();
-            for (_, incoming) in self.blade_graph.graph.inedges(node) {
-                hs.extend(self.ancestors_of(incoming))
-            }
-            hs
-        }
     }
 }
 
