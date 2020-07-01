@@ -441,7 +441,6 @@ impl BladeGraph {
         let mut ancestors = AncestorsOf {
             blade_graph: self,
             seen_nodes: HashSet::new(),
-            ancestors: HashSet::new(),
         };
         ancestors.ancestors_of(node)
     }
@@ -457,7 +456,6 @@ impl BladeGraph {
 struct AncestorsOf<'a> {
     blade_graph: &'a BladeGraph,
     seen_nodes: HashSet<Node<usize>>,
-    ancestors: HashSet<Node<usize>>,
 }
 
 impl<'a> AncestorsOf<'a> {
