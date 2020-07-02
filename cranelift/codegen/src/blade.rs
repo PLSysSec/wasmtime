@@ -42,7 +42,13 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         } else {
             false
         };
-    let blade_graph = build_blade_graph_for_func(func, cfg, store_values_are_sinks);
+    let constant_addr_loads_are_srcs =
+        if isa.flags().blade_v1_1() {
+            true
+        } else {
+            false
+        };
+    let blade_graph = build_blade_graph_for_func(func, cfg, store_values_are_sinks, constant_addr_loads_are_srcs);
 
     // insert the fences / SLHs
     let mut slh_ctx = SLHContext::new();
@@ -560,6 +566,7 @@ fn build_blade_graph_for_func(
     func: &mut Function,
     cfg: &ControlFlowGraph,
     store_values_are_sinks: bool,
+    constant_addr_loads_are_srcs: bool,
 ) -> BladeGraph {
     let mut builder = BladeGraphBuilder::with_nodes_for_func(func);
 
@@ -573,8 +580,10 @@ fn build_blade_graph_for_func(
                 // except for fills, which don't have sinks
 
                 // handle load as a source
-                for &result in func.dfg.inst_results(inst) {
-                    builder.mark_as_source(result);
+                if constant_addr_loads_are_srcs || !load_is_constant_addr(func, inst) {
+                    for &result in func.dfg.inst_results(inst) {
+                        builder.mark_as_source(result);
+                    }
                 }
 
                 // handle load as a sink, except for fills
@@ -678,4 +687,222 @@ fn build_blade_graph_for_func(
     }
 
     builder.build()
+}
+
+/// Is the given `inst` (representing a load instruction) a constant-addr load
+/// instruction?
+fn load_is_constant_addr(func: &Function, inst: Inst) -> bool {
+    // We assume all arguments contribute to the address, and thus all arguments
+    // must be constant, for the load to be considered constant addr
+    all_args_are_constant(func, inst)
+}
+
+/// Are all the arguments of the given `inst` constant?
+fn all_args_are_constant(func: &Function, inst: Inst) -> bool {
+    func.dfg.inst_args(inst)
+        .iter()
+        .all(|&value| value_is_constant(func, value))
+}
+
+/// Is the given `Value` a constant?
+fn value_is_constant(func: &Function, value: Value) -> bool {
+    match func.dfg.value_def(value) {
+        ValueDef::Param(_, _) => false, // conservatively assume that block parameters are not constant
+        ValueDef::Result(inst, _) => {
+            let opcode = func.dfg[inst].opcode();
+            match opcode {
+                // constants
+                Opcode::Iconst
+                | Opcode::F32const
+                | Opcode::F64const
+                | Opcode::Bconst
+                | Opcode::Vconst
+                | Opcode::ConstAddr
+                | Opcode::Null
+                => true,
+                // addresses
+                Opcode::FuncAddr
+                | Opcode::StackAddr
+                | Opcode::HeapAddr
+                | Opcode::TableAddr
+                // arithmetic/bitwise ops etc
+                | Opcode::Iadd
+                | Opcode::IaddImm
+                | Opcode::UaddSat
+                | Opcode::SaddSat
+                | Opcode::Isub
+                | Opcode::IrsubImm
+                | Opcode::UsubSat
+                | Opcode::SsubSat
+                | Opcode::Ineg
+                | Opcode::Imul
+                | Opcode::ImulImm
+                | Opcode::Umulhi
+                | Opcode::Smulhi
+                | Opcode::Udiv
+                | Opcode::UdivImm
+                | Opcode::Sdiv
+                | Opcode::SdivImm
+                | Opcode::Urem
+                | Opcode::UremImm
+                | Opcode::Srem
+                | Opcode::SremImm
+                | Opcode::Imin
+                | Opcode::Umin
+                | Opcode::Imax
+                | Opcode::Umax
+                | Opcode::Band
+                | Opcode::BandImm
+                | Opcode::BandNot
+                | Opcode::Bor
+                | Opcode::BorImm
+                | Opcode::BorNot
+                | Opcode::Bxor
+                | Opcode::BxorImm
+                | Opcode::BxorNot
+                | Opcode::Bnot
+                | Opcode::Rotl
+                | Opcode::RotlImm
+                | Opcode::Rotr
+                | Opcode::RotrImm
+                | Opcode::Ishl
+                | Opcode::IshlImm
+                | Opcode::Ushr
+                | Opcode::UshrImm
+                | Opcode::Sshr
+                | Opcode::SshrImm
+                | Opcode::Bitrev
+                | Opcode::IaddCin
+                | Opcode::IaddIfcin
+                | Opcode::IaddCout
+                | Opcode::IaddIfcout
+                | Opcode::IaddCarry
+                | Opcode::IaddIfcarry
+                | Opcode::IsubBin
+                | Opcode::IsubIfbin
+                | Opcode::IsubBout
+                | Opcode::IsubIfbout
+                | Opcode::IsubBorrow
+                | Opcode::IsubIfborrow
+                | Opcode::Select
+                | Opcode::Selectif
+                | Opcode::Bitselect
+                // comparisons
+                | Opcode::Icmp
+                | Opcode::IcmpImm
+                | Opcode::Ifcmp
+                | Opcode::IfcmpImm
+                | Opcode::Fcmp
+                | Opcode::Ffcmp
+                // FP ops
+                | Opcode::Fadd
+                | Opcode::Fsub
+                | Opcode::Fmul
+                | Opcode::Fdiv
+                | Opcode::Sqrt
+                | Opcode::Fma
+                | Opcode::Fneg
+                | Opcode::Fabs
+                | Opcode::Fcopysign
+                | Opcode::Fmin
+                | Opcode::Fmax
+                | Opcode::Ceil
+                | Opcode::Floor
+                | Opcode::Trunc
+                | Opcode::Nearest
+                // vector ops
+                | Opcode::Insertlane
+                | Opcode::Extractlane
+                | Opcode::Splat
+                | Opcode::Swizzle
+                | Opcode::Vsplit
+                | Opcode::Vconcat
+                | Opcode::Vselect
+                | Opcode::VanyTrue
+                | Opcode::VallTrue
+                // other ops
+                | Opcode::IsNull
+                | Opcode::IsInvalid
+                | Opcode::Trueif
+                | Opcode::Trueff
+                | Opcode::Breduce
+                | Opcode::Bextend
+                | Opcode::Bint
+                | Opcode::Bmask
+                | Opcode::Ireduce
+                // copies
+                | Opcode::Copy
+                | Opcode::CopySpecial
+                | Opcode::CopyToSsa
+                | Opcode::CopyNop
+                | Opcode::Regmove
+                | Opcode::Bitcast
+                | Opcode::RawBitcast
+                | Opcode::ScalarToVector
+                | Opcode::Nop
+                => all_args_are_constant(func, inst),
+                Opcode::Load
+                | Opcode::LoadComplex
+                | Opcode::Uload8
+                | Opcode::Uload8Complex
+                | Opcode::Uload16
+                | Opcode::Uload16Complex
+                | Opcode::Uload32
+                | Opcode::Uload32Complex
+                | Opcode::Sload8
+                | Opcode::Sload8Complex
+                | Opcode::Sload16
+                | Opcode::Sload16Complex
+                | Opcode::Sload32
+                | Opcode::Sload32Complex
+                | Opcode::Uload8x8
+                | Opcode::Uload16x4
+                | Opcode::Uload32x2
+                | Opcode::Sload8x8
+                | Opcode::Sload16x4
+                | Opcode::Sload32x2
+                | Opcode::StackLoad
+                | Opcode::Fill
+                | Opcode::FillNop
+                | Opcode::Regfill
+                | Opcode::GetPinnedReg
+                | Opcode::SetPinnedReg
+                | Opcode::IfcmpSp
+                | Opcode::Call
+                | Opcode::CallIndirect
+                => false,
+                Opcode::Jump
+                | Opcode::Fallthrough
+                | Opcode::Return
+                | Opcode::Brz
+                | Opcode::Brnz
+                | Opcode::BrIcmp
+                | Opcode::Brif
+                | Opcode::Brff
+                | Opcode::BrTable
+                | Opcode::Store
+                | Opcode::StoreComplex
+                | Opcode::Istore8
+                | Opcode::Istore8Complex
+                | Opcode::Istore16
+                | Opcode::Istore16Complex
+                | Opcode::Istore32
+                | Opcode::Istore32Complex
+                | Opcode::StackStore
+                | Opcode::Spill
+                | Opcode::Regspill
+                | Opcode::AdjustSpDown
+                | Opcode::AdjustSpUpImm
+                | Opcode::AdjustSpDownImm
+                | Opcode::Trap
+                | Opcode::Trapz
+                | Opcode::Trapnz
+                | Opcode::Trapif
+                | Opcode::Trapff
+                | Opcode::ResumableTrap
+                => panic!("Didn't expect instruction with opcode {:?} to produce a value", opcode),
+                _ => unimplemented!("value_is_constant: opcode {:?}", opcode),
+            }
+        }
+    }
 }

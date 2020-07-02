@@ -386,10 +386,17 @@ impl Config {
         self
     }
 
-    /// Sets the Blade setting to be passed on to Cranelift
-    pub fn blade(&mut self, blade: impl AsRef<str>) -> Result<&mut Self> {
-        self.flags.set("blade", blade.as_ref())?; // blade.as_ref().parse().expect("Failed to parse blade setting");
+    /// Sets the blade_type setting to be passed on to Cranelift
+    pub fn blade_type(&mut self, blade_type: impl AsRef<str>) -> Result<&mut Self> {
+        self.flags.set("blade_type", blade_type.as_ref())?; // blade_type.as_ref().parse().expect("Failed to parse blade_type setting");
         Ok(self)
+    }
+
+    /// Enables the blade_v1_1 setting to be passed on to Cranelift
+    pub fn blade_v1_1(&mut self, enable: bool) -> &mut Self {
+        let val = if enable { "true" } else { "false" };
+        self.flags.set("blade_v1_1", val).expect("should be valid flag");
+        self
     }
 }
 

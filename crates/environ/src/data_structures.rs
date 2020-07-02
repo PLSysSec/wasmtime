@@ -9,7 +9,7 @@ pub mod ir {
 }
 
 pub mod settings {
-    pub use cranelift_codegen::settings::{builder, Blade, Builder, Configurable, Flags};
+    pub use cranelift_codegen::settings::{builder, BladeType, Builder, Configurable, Flags};
 }
 
 pub mod isa {
