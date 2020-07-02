@@ -5,7 +5,7 @@ use crate::entity::SecondaryMap;
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::{condcodes::IntCC, dfg::Bounds, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef};
 use crate::isa::TargetIsa;
-use crate::settings;
+use crate::settings::BladeType;
 use rs_graph::linkedlistgraph::{Edge, LinkedListGraph, Node};
 use rs_graph::maxflow::pushrelabel::PushRelabel;
 use rs_graph::maxflow::MaxFlow;
@@ -26,8 +26,25 @@ pub(crate) const FAKE_SLH_ARRAY_LENGTH_BYTES: u32 = 2345;
 
 const DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER: bool = false;
 
+/// Should we print the (static) count of fences/SLHs
+pub const PRINT_FENCE_COUNTS: bool = true;
+
+struct FenceCounts {
+    static_fences_inserted: usize,
+    static_slhs_inserted: usize,
+}
+
+impl FenceCounts {
+    fn new() -> Self {
+        Self {
+            static_fences_inserted: 0,
+            static_slhs_inserted: 0,
+        }
+    }
+}
+
 pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph) {
-    if isa.flags().blade_type() == settings::BladeType::None {
+    if isa.flags().blade_type() == BladeType::None {
         return;
     }
 
@@ -35,8 +52,10 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         println!("Function before blade:\n{}", func.display(isa));
     }
 
+    let mut fence_counts = FenceCounts::new();
+
     let store_values_are_sinks =
-        if isa.flags().blade_type() == settings::BladeType::Slh && isa.flags().blade_v1_1() {
+        if isa.flags().blade_type() == BladeType::Slh && isa.flags().blade_v1_1() {
             // For SLH to protect from v1.1, store values must be marked as sinks
             true
         } else {
@@ -57,7 +76,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         let edge_src = blade_graph.graph.src(cut_edge);
         let edge_snk = blade_graph.graph.snk(cut_edge);
         match blade_type {
-            settings::BladeType::Lfence | settings::BladeType::LfencePerBlock => {
+            BladeType::Lfence | BladeType::LfencePerBlock => {
                 if edge_src == blade_graph.source_node {
                     // source -> n : fence after n
                     insert_fence_after(
@@ -68,6 +87,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                             .unwrap()
                             .clone(),
                         blade_type,
+                        &mut fence_counts,
                     );
                 } else if edge_snk == blade_graph.sink_node {
                     // n -> sink : fence before (def of) n
@@ -79,6 +99,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                             .unwrap()
                             .clone(),
                         blade_type,
+                        &mut fence_counts,
                     );
                 } else {
                     // n -> m : fence before m
@@ -90,48 +111,71 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                             .unwrap()
                             .clone(),
                         blade_type,
+                        &mut fence_counts,
                     );
                 }
             }
-            settings::BladeType::Slh => {
+            BladeType::Slh => {
                 if edge_src == blade_graph.source_node {
                     // source -> n : apply SLH to the instruction that produces n
-                    slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&edge_snk].clone());
+                    slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&edge_snk].clone(), &mut fence_counts);
                 } else if edge_snk == blade_graph.sink_node {
                     // n -> sink : for SLH we can't cut at n (which is a sink instruction), we have
                     // to trace back through the graph and cut at all sources which lead to n
                     for node in blade_graph.ancestors_of(edge_src) {
-                        slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone());
+                        slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone(), &mut fence_counts);
                     }
                 } else {
                     // n -> m : likewise, apply SLH to all sources which lead to n
                     for node in blade_graph.ancestors_of(edge_src) {
-                        slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone());
+                        slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone(), &mut fence_counts);
                     }
                 }
             }
-            settings::BladeType::None => panic!("Shouldn't reach here with Blade setting None"),
+            BladeType::None => panic!("Shouldn't reach here with Blade setting None"),
         }
     }
 
     if DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER {
         println!("Function after blade:\n{}", func.display(isa));
     }
+
+    if PRINT_FENCE_COUNTS {
+        match blade_type {
+            BladeType::Lfence | BladeType::LfencePerBlock => {
+                println!("function {}: inserted {} (static) lfences", func.name, fence_counts.static_fences_inserted);
+                assert_eq!(fence_counts.static_slhs_inserted, 0);
+            }
+            BladeType::Slh => {
+                println!("function {}: inserted {} (static) SLHs", func.name, fence_counts.static_slhs_inserted);
+                assert_eq!(fence_counts.static_fences_inserted, 0);
+            }
+            BladeType::None => {
+                assert_eq!(fence_counts.static_fences_inserted, 0);
+                assert_eq!(fence_counts.static_slhs_inserted, 0);
+            }
+        }
+    }
 }
 
-fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: settings::BladeType) {
+fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: BladeType, fence_counts: &mut FenceCounts) {
     match bnode {
         BladeNode::ValueDef(val) => match func.dfg.value_def(val) {
             ValueDef::Result(inst, _) => {
                 match blade_type {
-                    settings::BladeType::Lfence => {
+                    BladeType::Lfence => {
                         // cut at this value by putting lfence before `inst`
-                        func.pre_lfence[inst] = true;
+                        if func.pre_lfence[inst] {
+                            // do nothing, already had a fence here
+                        } else {
+                            func.pre_lfence[inst] = true;
+                            fence_counts.static_fences_inserted += 1;
+                        }
                     }
-                    settings::BladeType::LfencePerBlock => {
+                    BladeType::LfencePerBlock => {
                         // just put one fence at the beginning of the block.
                         // this stops speculation due to branch mispredictions.
-                        insert_fence_at_beginning_of_block(func, inst);
+                        insert_fence_at_beginning_of_block(func, inst, fence_counts);
                     }
                     _ => panic!(
                         "This function didn't expect to be called with blade_type {:?}",
@@ -146,19 +190,29 @@ fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: settin
                     .layout
                     .first_inst(block)
                     .expect("block has no instructions");
-                func.pre_lfence[first_inst] = true;
+                if func.pre_lfence[first_inst] {
+                    // do nothing, already had a fence there
+                } else {
+                    func.pre_lfence[first_inst] = true;
+                    fence_counts.static_fences_inserted += 1;
+                }
             }
         },
         BladeNode::Sink(inst) => {
             match blade_type {
-                settings::BladeType::Lfence => {
+                BladeType::Lfence => {
                     // cut at this instruction by putting lfence before it
-                    func.pre_lfence[inst] = true;
+                    if func.pre_lfence[inst] {
+                        // do nothing, already had a fence here
+                    } else {
+                        func.pre_lfence[inst] = true;
+                        fence_counts.static_fences_inserted += 1;
+                    }
                 }
-                settings::BladeType::LfencePerBlock => {
+                BladeType::LfencePerBlock => {
                     // just put one fence at the beginning of the block.
                     // this stops speculation due to branch mispredictions.
-                    insert_fence_at_beginning_of_block(func, inst);
+                    insert_fence_at_beginning_of_block(func, inst, fence_counts);
                 }
                 _ => panic!(
                     "This function didn't expect to be called with blade_type {:?}",
@@ -169,19 +223,24 @@ fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: settin
     }
 }
 
-fn insert_fence_after(func: &mut Function, bnode: BladeNode, blade_type: settings::BladeType) {
+fn insert_fence_after(func: &mut Function, bnode: BladeNode, blade_type: BladeType, fence_counts: &mut FenceCounts) {
     match bnode {
         BladeNode::ValueDef(val) => match func.dfg.value_def(val) {
             ValueDef::Result(inst, _) => {
                 match blade_type {
-                    settings::BladeType::Lfence => {
+                    BladeType::Lfence => {
                         // cut at this value by putting lfence after `inst`
-                        func.post_lfence[inst] = true;
+                        if func.post_lfence[inst] {
+                            // do nothing, already had a fence here
+                        } else {
+                            func.post_lfence[inst] = true;
+                            fence_counts.static_fences_inserted += 1;
+                        }
                     }
-                    settings::BladeType::LfencePerBlock => {
+                    BladeType::LfencePerBlock => {
                         // just put one fence at the beginning of the block.
                         // this stops speculation due to branch mispredictions.
-                        insert_fence_at_beginning_of_block(func, inst);
+                        insert_fence_at_beginning_of_block(func, inst, fence_counts);
                     }
                     _ => panic!(
                         "This function didn't expect to be called with blade_type {:?}",
@@ -196,7 +255,12 @@ fn insert_fence_after(func: &mut Function, bnode: BladeNode, blade_type: setting
                     .layout
                     .first_inst(block)
                     .expect("block has no instructions");
-                func.pre_lfence[first_inst] = true;
+                if func.pre_lfence[first_inst] {
+                    // do nothing, already had a fence here
+                } else {
+                    func.pre_lfence[first_inst] = true;
+                    fence_counts.static_fences_inserted += 1;
+                }
             }
         },
         BladeNode::Sink(_) => panic!("Fencing after a sink instruction"),
@@ -210,7 +274,7 @@ fn insert_fence_after(func: &mut Function, bnode: BladeNode, blade_type: setting
 // terminate blocks. In contrast, in Cranelift, only unconditional branch and
 // ret instructions terminate EBBs, while conditional branches and call
 // instructions do not terminate EBBs.
-fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst) {
+fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, fence_counts: &mut FenceCounts) {
     let ebb = func
         .layout
         .inst_block(inst)
@@ -223,7 +287,12 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst) {
     loop {
         if cur_inst == first_inst {
             // got to beginning of EBB: insert at beginning of EBB
-            func.pre_lfence[first_inst] = true;
+            if func.pre_lfence[first_inst] {
+                // do nothing, already had a fence here
+            } else {
+                func.pre_lfence[first_inst] = true;
+                fence_counts.static_fences_inserted += 1;
+            }
             break;
         }
         cur_inst = func
@@ -234,7 +303,12 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst) {
         if opcode.is_call() || opcode.is_branch() || opcode.is_indirect_branch() {
             // found the previous call or branch instruction:
             // insert after that call or branch instruction
-            func.post_lfence[cur_inst] = true;
+            if func.post_lfence[cur_inst] {
+                // do nothing, already had a fence here
+            } else {
+                func.post_lfence[cur_inst] = true;
+                fence_counts.static_fences_inserted += 1;
+            }
             break;
         }
     }
@@ -254,9 +328,10 @@ impl SLHContext {
     }
 
     /// Do SLH on `bnode`, but only if we haven't already done SLH on `bnode`
-    fn do_slh_on(&mut self, func: &mut Function, isa: &dyn TargetIsa, bnode: BladeNode) {
+    fn do_slh_on(&mut self, func: &mut Function, isa: &dyn TargetIsa, bnode: BladeNode, fence_counts: &mut FenceCounts) {
         if self.bladenodes_done.insert(bnode.clone()) {
             _do_slh_on(func, isa, bnode);
+            fence_counts.static_slhs_inserted += 1;
         }
     }
 }
