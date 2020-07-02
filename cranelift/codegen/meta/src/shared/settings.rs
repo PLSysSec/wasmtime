@@ -269,12 +269,14 @@ pub(crate) fn define() -> SettingGroup {
             What kind of Blade Spectre mitigation to use.
 
             none: no Spectre mitigation
+            baseline: insert lfences at every source
             lfence: insert lfences at cut points
             lfence_per_block: insert lfences at top of block containing the cut point, max one lfence per block
             slh: use SLH on the loads leading to cut points (can't SLH on the cut points themselves)
         "#,
         vec![
             "none",
+            "baseline",
             "lfence",
             "lfence_per_block",
             "slh",

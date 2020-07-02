@@ -9,7 +9,7 @@ use crate::settings::BladeType;
 use rs_graph::linkedlistgraph::{Edge, LinkedListGraph, Node};
 use rs_graph::maxflow::pushrelabel::PushRelabel;
 use rs_graph::maxflow::MaxFlow;
-use rs_graph::traits::Directed;
+use rs_graph::traits::{Directed, GraphSize};
 use rs_graph::Buildable;
 use rs_graph::Builder;
 use std::collections::{HashMap, HashSet};
@@ -72,11 +72,22 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
     // insert the fences / SLHs
     let mut slh_ctx = SLHContext::new();
     let blade_type = isa.flags().blade_type();
-    for cut_edge in blade_graph.min_cut() {
-        let edge_src = blade_graph.graph.src(cut_edge);
-        let edge_snk = blade_graph.graph.snk(cut_edge);
-        match blade_type {
-            BladeType::Lfence | BladeType::LfencePerBlock => {
+    match blade_type {
+        BladeType::Baseline => {
+            for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
+                // insert a fence after every source
+                insert_fence_after(
+                    func,
+                    blade_graph.node_to_bladenode_map.get(&source).unwrap().clone(),
+                    blade_type,
+                    &mut fence_counts,
+                )
+            }
+        }
+        BladeType::Lfence | BladeType::LfencePerBlock => {
+            for cut_edge in blade_graph.min_cut() {
+                let edge_src = blade_graph.graph.src(cut_edge);
+                let edge_snk = blade_graph.graph.snk(cut_edge);
                 if edge_src == blade_graph.source_node {
                     // source -> n : fence after n
                     insert_fence_after(
@@ -115,7 +126,11 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                     );
                 }
             }
-            BladeType::Slh => {
+        }
+        BladeType::Slh => {
+            for cut_edge in blade_graph.min_cut() {
+                let edge_src = blade_graph.graph.src(cut_edge);
+                let edge_snk = blade_graph.graph.snk(cut_edge);
                 if edge_src == blade_graph.source_node {
                     // source -> n : apply SLH to the instruction that produces n
                     slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&edge_snk].clone(), &mut fence_counts);
@@ -132,8 +147,8 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                     }
                 }
             }
-            BladeType::None => panic!("Shouldn't reach here with Blade setting None"),
         }
+        BladeType::None => panic!("Shouldn't reach here with Blade setting None"),
     }
 
     if DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER {
@@ -163,7 +178,7 @@ fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: BladeT
         BladeNode::ValueDef(val) => match func.dfg.value_def(val) {
             ValueDef::Result(inst, _) => {
                 match blade_type {
-                    BladeType::Lfence => {
+                    BladeType::Lfence | BladeType::Baseline => {
                         // cut at this value by putting lfence before `inst`
                         if func.pre_lfence[inst] {
                             // do nothing, already had a fence here
@@ -200,7 +215,7 @@ fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: BladeT
         },
         BladeNode::Sink(inst) => {
             match blade_type {
-                BladeType::Lfence => {
+                BladeType::Lfence | BladeType::Baseline => {
                     // cut at this instruction by putting lfence before it
                     if func.pre_lfence[inst] {
                         // do nothing, already had a fence here
@@ -228,7 +243,7 @@ fn insert_fence_after(func: &mut Function, bnode: BladeNode, blade_type: BladeTy
         BladeNode::ValueDef(val) => match func.dfg.value_def(val) {
             ValueDef::Result(inst, _) => {
                 match blade_type {
-                    BladeType::Lfence => {
+                    BladeType::Lfence | BladeType::Baseline => {
                         // cut at this value by putting lfence after `inst`
                         if func.post_lfence[inst] {
                             // do nothing, already had a fence here
