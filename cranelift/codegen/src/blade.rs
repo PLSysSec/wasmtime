@@ -44,12 +44,10 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         };
     let blade_graph = build_blade_graph_for_func(func, cfg, store_values_are_sinks);
 
-    let cut_edges = blade_graph.min_cut();
-
     // insert the fences / SLHs
     let mut slh_ctx = SLHContext::new();
     let blade_type = isa.flags().blade_type();
-    for cut_edge in cut_edges {
+    for cut_edge in blade_graph.min_cut() {
         let edge_src = blade_graph.graph.src(cut_edge);
         let edge_snk = blade_graph.graph.snk(cut_edge);
         match blade_type {
