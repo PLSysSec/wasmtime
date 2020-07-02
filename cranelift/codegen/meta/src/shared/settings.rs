@@ -264,23 +264,30 @@ pub(crate) fn define() -> SettingGroup {
     // Blade
 
     settings.add_enum(
-        "blade",
+        "blade_type",
         r#"
             What kind of Blade Spectre mitigation to use.
 
             none: no Spectre mitigation
             lfence: insert lfences at cut points
             lfence_per_block: insert lfences at top of block containing the cut point, max one lfence per block
-            slh_no_1_1: use SLH on the loads leading to cut points (can't SLH on the cut points themselves)
-            slh_with_1_1: same, but also protecting from v1.1 by marking store values as sinks
+            slh: use SLH on the loads leading to cut points (can't SLH on the cut points themselves)
         "#,
         vec![
             "none",
             "lfence",
             "lfence_per_block",
-            "slh_no_1_1",
-            "slh_with_1_1",
+            "slh",
         ],
+    );
+
+    settings.add_bool(
+        "blade_v1_1",
+        r#"
+            Setting this to true enables Spectre v1.1 protections. By default
+            only Spectre v1 protections are enabled.
+        "#,
+        false,
     );
 
     settings.build()

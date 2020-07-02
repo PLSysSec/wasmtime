@@ -26,8 +26,8 @@ pub(crate) const FAKE_SLH_ARRAY_LENGTH_BYTES: u32 = 2345;
 
 const DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER: bool = false;
 
-pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph, blade_setting: settings::Blade) {
-    if blade_setting == settings::Blade::None {
+pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph) {
+    if isa.flags().blade_type() == settings::BladeType::None {
         return;
     }
 
@@ -35,23 +35,25 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         println!("Function before blade:\n{}", func.display(isa));
     }
 
-    let store_values_are_sinks = if blade_setting == settings::Blade::SlhWith11 {
-        // For this setting, store values must be marked as sinks
-        true
-    } else {
-        false
-    };
+    let store_values_are_sinks =
+        if isa.flags().blade_type() == settings::BladeType::Slh && isa.flags().blade_v1_1() {
+            // For SLH to protect from v1.1, store values must be marked as sinks
+            true
+        } else {
+            false
+        };
     let blade_graph = build_blade_graph_for_func(func, cfg, store_values_are_sinks);
 
     let cut_edges = blade_graph.min_cut();
 
     // insert the fences / SLHs
     let mut slh_ctx = SLHContext::new();
+    let blade_type = isa.flags().blade_type();
     for cut_edge in cut_edges {
         let edge_src = blade_graph.graph.src(cut_edge);
         let edge_snk = blade_graph.graph.snk(cut_edge);
-        match blade_setting {
-            settings::Blade::Lfence | settings::Blade::LfencePerBlock => {
+        match blade_type {
+            settings::BladeType::Lfence | settings::BladeType::LfencePerBlock => {
                 if edge_src == blade_graph.source_node {
                     // source -> n : fence after n
                     insert_fence_after(
@@ -61,7 +63,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                             .get(&edge_snk)
                             .unwrap()
                             .clone(),
-                        blade_setting,
+                        blade_type,
                     );
                 } else if edge_snk == blade_graph.sink_node {
                     // n -> sink : fence before (def of) n
@@ -72,7 +74,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                             .get(&edge_src)
                             .unwrap()
                             .clone(),
-                        blade_setting,
+                        blade_type,
                     );
                 } else {
                     // n -> m : fence before m
@@ -83,11 +85,11 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                             .get(&edge_snk)
                             .unwrap()
                             .clone(),
-                        blade_setting,
+                        blade_type,
                     );
                 }
             }
-            settings::Blade::SlhNo11 | settings::Blade::SlhWith11 => {
+            settings::BladeType::Slh => {
                 if edge_src == blade_graph.source_node {
                     // source -> n : apply SLH to the instruction that produces n
                     slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&edge_snk].clone());
@@ -104,7 +106,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                     }
                 }
             }
-            settings::Blade::None => panic!("Shouldn't reach here with Blade setting None"),
+            settings::BladeType::None => panic!("Shouldn't reach here with Blade setting None"),
         }
     }
 
@@ -113,23 +115,23 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
     }
 }
 
-fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_setting: settings::Blade) {
+fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: settings::BladeType) {
     match bnode {
         BladeNode::ValueDef(val) => match func.dfg.value_def(val) {
             ValueDef::Result(inst, _) => {
-                match blade_setting {
-                    settings::Blade::Lfence => {
+                match blade_type {
+                    settings::BladeType::Lfence => {
                         // cut at this value by putting lfence before `inst`
                         func.pre_lfence[inst] = true;
                     }
-                    settings::Blade::LfencePerBlock => {
+                    settings::BladeType::LfencePerBlock => {
                         // just put one fence at the beginning of the block.
                         // this stops speculation due to branch mispredictions.
                         insert_fence_at_beginning_of_block(func, inst);
                     }
                     _ => panic!(
-                        "This function didn't expect to be called with blade setting {:?}",
-                        blade_setting
+                        "This function didn't expect to be called with blade_type {:?}",
+                        blade_type
                     ),
                 }
             }
@@ -144,42 +146,42 @@ fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_setting: set
             }
         },
         BladeNode::Sink(inst) => {
-            match blade_setting {
-                settings::Blade::Lfence => {
+            match blade_type {
+                settings::BladeType::Lfence => {
                     // cut at this instruction by putting lfence before it
                     func.pre_lfence[inst] = true;
                 }
-                settings::Blade::LfencePerBlock => {
+                settings::BladeType::LfencePerBlock => {
                     // just put one fence at the beginning of the block.
                     // this stops speculation due to branch mispredictions.
                     insert_fence_at_beginning_of_block(func, inst);
                 }
                 _ => panic!(
-                    "This function didn't expect to be called with blade setting {:?}",
-                    blade_setting
+                    "This function didn't expect to be called with blade_type {:?}",
+                    blade_type
                 ),
             }
         }
     }
 }
 
-fn insert_fence_after(func: &mut Function, bnode: BladeNode, blade_setting: settings::Blade) {
+fn insert_fence_after(func: &mut Function, bnode: BladeNode, blade_type: settings::BladeType) {
     match bnode {
         BladeNode::ValueDef(val) => match func.dfg.value_def(val) {
             ValueDef::Result(inst, _) => {
-                match blade_setting {
-                    settings::Blade::Lfence => {
+                match blade_type {
+                    settings::BladeType::Lfence => {
                         // cut at this value by putting lfence after `inst`
                         func.post_lfence[inst] = true;
                     }
-                    settings::Blade::LfencePerBlock => {
+                    settings::BladeType::LfencePerBlock => {
                         // just put one fence at the beginning of the block.
                         // this stops speculation due to branch mispredictions.
                         insert_fence_at_beginning_of_block(func, inst);
                     }
                     _ => panic!(
-                        "This function didn't expect to be called with blade setting {:?}",
-                        blade_setting
+                        "This function didn't expect to be called with blade_type {:?}",
+                        blade_type
                     ),
                 }
             }
