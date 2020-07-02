@@ -35,7 +35,13 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         println!("Function before blade:\n{}", func.display(isa));
     }
 
-    let blade_graph = build_blade_graph_for_func(func, cfg, true);
+    let store_values_are_sinks = if blade_setting == settings::Blade::SlhWith11 {
+        // For this setting, store values must be marked as sinks
+        true
+    } else {
+        false
+    };
+    let blade_graph = build_blade_graph_for_func(func, cfg, store_values_are_sinks);
 
     let cut_edges = blade_graph.min_cut();
 
@@ -81,7 +87,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                     );
                 }
             }
-            settings::Blade::Slh => {
+            settings::Blade::SlhNo11 | settings::Blade::SlhWith11 => {
                 if edge_src == blade_graph.source_node {
                     // source -> n : apply SLH to the instruction that produces n
                     slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&edge_snk].clone());

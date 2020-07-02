@@ -271,13 +271,15 @@ pub(crate) fn define() -> SettingGroup {
             none: no Spectre mitigation
             lfence: insert lfences at cut points
             lfence_per_block: insert lfences at top of block containing the cut point, max one lfence per block
-            slh: use SLH on the loads leading to cut points (can't SLH on the cut points themselves)
+            slh_no_1_1: use SLH on the loads leading to cut points (can't SLH on the cut points themselves)
+            slh_with_1_1: same, but also protecting from v1.1 by marking store values as sinks
         "#,
         vec![
             "none",
             "lfence",
             "lfence_per_block",
-            "slh",
+            "slh_no_1_1",
+            "slh_with_1_1",
         ],
     );
 
