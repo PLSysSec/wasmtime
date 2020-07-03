@@ -3,7 +3,7 @@
 use crate::cursor::{Cursor, EncCursor};
 use crate::entity::SecondaryMap;
 use crate::flowgraph::ControlFlowGraph;
-use crate::ir::{condcodes::IntCC, dfg::Bounds, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef};
+use crate::ir::{condcodes::IntCC, dfg::Bounds, ArgumentPurpose, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef};
 use crate::isa::TargetIsa;
 use crate::settings::BladeType;
 use rs_graph::linkedlistgraph::{Edge, LinkedListGraph, Node};
@@ -27,7 +27,7 @@ pub(crate) const FAKE_SLH_ARRAY_LENGTH_BYTES: u32 = 2345;
 const DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER: bool = false;
 
 /// Should we print the (static) count of fences/SLHs
-pub const PRINT_FENCE_COUNTS: bool = true;
+const PRINT_FENCE_COUNTS: bool = true;
 
 struct FenceCounts {
     static_fences_inserted: usize,
@@ -782,9 +782,19 @@ fn build_blade_graph_for_func(
 /// Is the given `inst` (representing a load instruction) a constant-addr load
 /// instruction?
 fn load_is_constant_addr(func: &Function, inst: Inst) -> bool {
-    // We assume all arguments contribute to the address, and thus all arguments
-    // must be constant, for the load to be considered constant addr
-    all_args_are_constant(func, inst)
+    let _idata = &func.dfg[inst];
+    let _args: Vec<_> = func.dfg.inst_args(inst).iter().collect();
+    match &func.dfg[inst] {
+        InstructionData::Load { arg, .. } => {
+            // the `offset` is always constant, so just check the `arg`
+            value_is_constant(func, *arg)
+        }
+        InstructionData::LoadComplex { args, .. } => {
+            // the `offset` is always constant, so just check the args
+            args.as_slice(&func.dfg.value_lists).iter().all(|&arg| value_is_constant(func, arg))
+        }
+        idata => unimplemented!("load_is_constant_addr: instruction data {:?}", idata),
+    }
 }
 
 /// Are all the arguments of the given `inst` constant?
@@ -796,8 +806,18 @@ fn all_args_are_constant(func: &Function, inst: Inst) -> bool {
 
 /// Is the given `Value` a constant?
 fn value_is_constant(func: &Function, value: Value) -> bool {
+    if let Some(vmctx) = func.special_param(ArgumentPurpose::VMContext) {
+        if value == vmctx {
+            // the heap base pointer, or other VMContext pointer, is effectively a constant,
+            // even though its value may not be known at this stage in the pipeline
+            return true;
+        }
+    }
     match func.dfg.value_def(value) {
-        ValueDef::Param(_, _) => false, // conservatively assume that block parameters are not constant
+        ValueDef::Param(_block, _i) => {
+            // conservatively assume that block parameters are not constant
+            false
+        }
         ValueDef::Result(inst, _) => {
             let opcode = func.dfg[inst].opcode();
             match opcode {
@@ -920,6 +940,10 @@ fn value_is_constant(func: &Function, value: Value) -> bool {
                 | Opcode::Bint
                 | Opcode::Bmask
                 | Opcode::Ireduce
+                | Opcode::Uextend
+                | Opcode::Sextend
+                | Opcode::Fpromote
+                | Opcode::Fdemote
                 // copies
                 | Opcode::Copy
                 | Opcode::CopySpecial
