@@ -157,7 +157,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
 
     if PRINT_FENCE_COUNTS {
         match blade_type {
-            BladeType::Lfence | BladeType::LfencePerBlock => {
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::Baseline => {
                 println!("function {}: inserted {} (static) lfences", func.name, fence_counts.static_fences_inserted);
                 assert_eq!(fence_counts.static_slhs_inserted, 0);
             }
