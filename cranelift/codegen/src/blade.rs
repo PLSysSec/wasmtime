@@ -793,6 +793,7 @@ fn load_is_constant_addr(func: &Function, inst: Inst) -> bool {
             // the `offset` is always constant, so just check the args
             args.as_slice(&func.dfg.value_lists).iter().all(|&arg| value_is_constant(func, arg))
         }
+        InstructionData::BranchTableEntry { .. } => false, // conservatively
         idata => unimplemented!("load_is_constant_addr: instruction data {:?}", idata),
     }
 }
