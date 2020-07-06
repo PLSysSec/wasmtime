@@ -720,14 +720,16 @@ fn build_blade_graph_for_func(
 
             }
             if op.is_call() {
-                // call instruction: must assume that the return value(s) could be a source
-                for &result in func.dfg.inst_results(inst) {
-                    builder.mark_as_source(result);
+                // to avoid interprocedural analysis, we require that function
+                // arguments are stable, so we mark arguments to a call as sinks
+                let inst_sink_node = builder.add_sink_node_for_inst(inst);
+                for &arg in func.dfg.inst_args(inst) {
+                    builder.add_edge_from_value_to_node(arg, inst_sink_node);
                 }
-
-                // and, to avoid interprocedural analysis, we require that
-                // function arguments are stable, so we mark arguments to a call
-                // as sinks
+            }
+            if op.is_return() {
+                // to avoid interprocedural analysis, we require that function
+                // return values are stable, so we mark return values as sinks
                 let inst_sink_node = builder.add_sink_node_for_inst(inst);
                 for &arg in func.dfg.inst_args(inst) {
                     builder.add_edge_from_value_to_node(arg, inst_sink_node);
