@@ -73,7 +73,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
     let mut slh_ctx = SLHContext::new();
     let blade_type = isa.flags().blade_type();
     match blade_type {
-        BladeType::Baseline => {
+        BladeType::BaselineFence => {
             for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
                 // insert a fence after every source
                 insert_fence_after(
@@ -82,6 +82,17 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                     blade_type,
                     &mut fence_counts,
                 )
+            }
+        }
+        BladeType::BaselineSlh => {
+            for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
+                // use SLH on every source
+                slh_ctx.do_slh_on(
+                    func,
+                    isa,
+                    blade_graph.node_to_bladenode_map[&source].clone(),
+                    &mut fence_counts,
+                );
             }
         }
         BladeType::Lfence | BladeType::LfencePerBlock => {
@@ -157,11 +168,11 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
 
     if PRINT_FENCE_COUNTS {
         match blade_type {
-            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::Baseline => {
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence => {
                 println!("function {}: inserted {} (static) lfences", func.name, fence_counts.static_fences_inserted);
                 assert_eq!(fence_counts.static_slhs_inserted, 0);
             }
-            BladeType::Slh => {
+            BladeType::Slh | BladeType::BaselineSlh => {
                 println!("function {}: inserted {} (static) SLHs", func.name, fence_counts.static_slhs_inserted);
                 assert_eq!(fence_counts.static_fences_inserted, 0);
             }
@@ -178,7 +189,7 @@ fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: BladeT
         BladeNode::ValueDef(val) => match func.dfg.value_def(val) {
             ValueDef::Result(inst, _) => {
                 match blade_type {
-                    BladeType::Lfence | BladeType::Baseline => {
+                    BladeType::Lfence | BladeType::BaselineFence => {
                         // cut at this value by putting lfence before `inst`
                         if func.pre_lfence[inst] {
                             // do nothing, already had a fence here
@@ -215,7 +226,7 @@ fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: BladeT
         },
         BladeNode::Sink(inst) => {
             match blade_type {
-                BladeType::Lfence | BladeType::Baseline => {
+                BladeType::Lfence | BladeType::BaselineFence => {
                     // cut at this instruction by putting lfence before it
                     if func.pre_lfence[inst] {
                         // do nothing, already had a fence here
@@ -243,7 +254,7 @@ fn insert_fence_after(func: &mut Function, bnode: BladeNode, blade_type: BladeTy
         BladeNode::ValueDef(val) => match func.dfg.value_def(val) {
             ValueDef::Result(inst, _) => {
                 match blade_type {
-                    BladeType::Lfence | BladeType::Baseline => {
+                    BladeType::Lfence | BladeType::BaselineFence => {
                         // cut at this value by putting lfence after `inst`
                         if func.post_lfence[inst] {
                             // do nothing, already had a fence here
