@@ -671,7 +671,36 @@ fn build_blade_graph_for_func(
 ) -> BladeGraph {
     let mut builder = BladeGraphBuilder::with_nodes_for_func(func);
 
-    // find sources and sinks, and add edges to/from our global source and sink nodes
+    // first we add edges for actual data dependencies
+    // for instance in the following pseudocode:
+    //     x = load y
+    //     z = x + 2
+    //     branch on z
+    // we need an edge x -> z; that's what we're doing now
+    // later we will add other edges to mark sinks and sources
+    // (in this example, z -> sink and source -> x)
+    let def_use_graph = DefUseGraph::for_function(func, cfg);
+    for val in func.dfg.values() {
+        let node = builder.bladenode_to_node_map[&BladeNode::ValueDef(val)]; // must exist
+        for val_use in def_use_graph.uses_of_val(val) {
+            match *val_use {
+                ValueUse::Inst(inst_use) => {
+                    // add an edge from val to the result of inst_use
+                    // TODO this assumes that all results depend on all operands;
+                    // are there any instructions where this is not the case for our purposes?
+                    for &result in func.dfg.inst_results(inst_use) {
+                        builder.add_edge_from_node_to_value(node, result);
+                    }
+                }
+                ValueUse::Value(val_use) => {
+                    // add an edge from val to val_use
+                    builder.add_edge_from_node_to_value(node, val_use);
+                }
+            }
+        }
+    }
+
+    // now we find sources and sinks, and add edges to/from our global source and sink nodes
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let idata = &func.dfg[inst];
@@ -761,33 +790,6 @@ fn build_blade_graph_for_func(
         builder.mark_as_source(func_param);
     }
     */
-
-    // now add edges for actual data dependencies
-    // for instance in the following pseudocode:
-    //     x = load y
-    //     z = x + 2
-    //     branch on z
-    // we have z -> sink and source -> x, but need x -> z yet
-    let def_use_graph = DefUseGraph::for_function(func, cfg);
-    for val in func.dfg.values() {
-        let node = builder.bladenode_to_node_map[&BladeNode::ValueDef(val)]; // must exist
-        for val_use in def_use_graph.uses_of_val(val) {
-            match *val_use {
-                ValueUse::Inst(inst_use) => {
-                    // add an edge from val to the result of inst_use
-                    // TODO this assumes that all results depend on all operands;
-                    // are there any instructions where this is not the case for our purposes?
-                    for &result in func.dfg.inst_results(inst_use) {
-                        builder.add_edge_from_node_to_value(node, result);
-                    }
-                }
-                ValueUse::Value(val_use) => {
-                    // add an edge from val to val_use
-                    builder.add_edge_from_node_to_value(node, val_use);
-                }
-            }
-        }
-    }
 
     builder.build()
 }
