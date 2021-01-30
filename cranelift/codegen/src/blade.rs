@@ -78,7 +78,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                 // insert a fence after every source
                 insert_fence_after(
                     func,
-                    blade_graph.node_to_bladenode_map.get(&source).unwrap().clone(),
+                    &blade_graph.node_to_bladenode_map[&source],
                     blade_type,
                     &mut fence_counts,
                 )
@@ -90,7 +90,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                 slh_ctx.do_slh_on(
                     func,
                     isa,
-                    blade_graph.node_to_bladenode_map[&source].clone(),
+                    &blade_graph.node_to_bladenode_map[&source],
                     &mut fence_counts,
                 );
             }
@@ -103,11 +103,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                     // source -> n : fence after n
                     insert_fence_after(
                         func,
-                        blade_graph
-                            .node_to_bladenode_map
-                            .get(&edge_snk)
-                            .unwrap()
-                            .clone(),
+                        &blade_graph.node_to_bladenode_map[&edge_snk],
                         blade_type,
                         &mut fence_counts,
                     );
@@ -115,11 +111,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                     // n -> sink : fence before (def of) n
                     insert_fence_before(
                         func,
-                        blade_graph
-                            .node_to_bladenode_map
-                            .get(&edge_src)
-                            .unwrap()
-                            .clone(),
+                        &blade_graph.node_to_bladenode_map[&edge_src],
                         blade_type,
                         &mut fence_counts,
                     );
@@ -127,11 +119,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                     // n -> m : fence before m
                     insert_fence_before(
                         func,
-                        blade_graph
-                            .node_to_bladenode_map
-                            .get(&edge_snk)
-                            .unwrap()
-                            .clone(),
+                        &blade_graph.node_to_bladenode_map[&edge_snk],
                         blade_type,
                         &mut fence_counts,
                     );
@@ -144,17 +132,17 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                 let edge_snk = blade_graph.graph.snk(cut_edge);
                 if edge_src == blade_graph.source_node {
                     // source -> n : apply SLH to the instruction that produces n
-                    slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&edge_snk].clone(), &mut fence_counts);
+                    slh_ctx.do_slh_on(func, isa, &blade_graph.node_to_bladenode_map[&edge_snk], &mut fence_counts);
                 } else if edge_snk == blade_graph.sink_node {
                     // n -> sink : for SLH we can't cut at n (which is a sink instruction), we have
                     // to trace back through the graph and cut at all sources which lead to n
                     for node in blade_graph.ancestors_of(edge_src) {
-                        slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone(), &mut fence_counts);
+                        slh_ctx.do_slh_on(func, isa, &blade_graph.node_to_bladenode_map[&node], &mut fence_counts);
                     }
                 } else {
                     // n -> m : likewise, apply SLH to all sources which lead to n
                     for node in blade_graph.ancestors_of(edge_src) {
-                        slh_ctx.do_slh_on(func, isa, blade_graph.node_to_bladenode_map[&node].clone(), &mut fence_counts);
+                        slh_ctx.do_slh_on(func, isa, &blade_graph.node_to_bladenode_map[&node], &mut fence_counts);
                     }
                 }
             }
@@ -184,9 +172,9 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
     }
 }
 
-fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: BladeType, fence_counts: &mut FenceCounts) {
+fn insert_fence_before(func: &mut Function, bnode: &BladeNode, blade_type: BladeType, fence_counts: &mut FenceCounts) {
     match bnode {
-        BladeNode::ValueDef(val) => match func.dfg.value_def(val) {
+        BladeNode::ValueDef(val) => match func.dfg.value_def(*val) {
             ValueDef::Result(inst, _) => {
                 match blade_type {
                     BladeType::Lfence | BladeType::BaselineFence => {
@@ -228,17 +216,17 @@ fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: BladeT
             match blade_type {
                 BladeType::Lfence | BladeType::BaselineFence => {
                     // cut at this instruction by putting lfence before it
-                    if func.pre_lfence[inst] {
+                    if func.pre_lfence[*inst] {
                         // do nothing, already had a fence here
                     } else {
-                        func.pre_lfence[inst] = true;
+                        func.pre_lfence[*inst] = true;
                         fence_counts.static_fences_inserted += 1;
                     }
                 }
                 BladeType::LfencePerBlock => {
                     // just put one fence at the beginning of the block.
                     // this stops speculation due to branch mispredictions.
-                    insert_fence_at_beginning_of_block(func, inst, fence_counts);
+                    insert_fence_at_beginning_of_block(func, *inst, fence_counts);
                 }
                 _ => panic!(
                     "This function didn't expect to be called with blade_type {:?}",
@@ -249,9 +237,9 @@ fn insert_fence_before(func: &mut Function, bnode: BladeNode, blade_type: BladeT
     }
 }
 
-fn insert_fence_after(func: &mut Function, bnode: BladeNode, blade_type: BladeType, fence_counts: &mut FenceCounts) {
+fn insert_fence_after(func: &mut Function, bnode: &BladeNode, blade_type: BladeType, fence_counts: &mut FenceCounts) {
     match bnode {
-        BladeNode::ValueDef(val) => match func.dfg.value_def(val) {
+        BladeNode::ValueDef(val) => match func.dfg.value_def(*val) {
             ValueDef::Result(inst, _) => {
                 match blade_type {
                     BladeType::Lfence | BladeType::BaselineFence => {
@@ -354,7 +342,7 @@ impl SLHContext {
     }
 
     /// Do SLH on `bnode`, but only if we haven't already done SLH on `bnode`
-    fn do_slh_on(&mut self, func: &mut Function, isa: &dyn TargetIsa, bnode: BladeNode, fence_counts: &mut FenceCounts) {
+    fn do_slh_on(&mut self, func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNode, fence_counts: &mut FenceCounts) {
         if self.bladenodes_done.insert(bnode.clone()) {
             _do_slh_on(func, isa, bnode);
             fence_counts.static_slhs_inserted += 1;
@@ -362,12 +350,12 @@ impl SLHContext {
     }
 }
 
-fn _do_slh_on(func: &mut Function, isa: &dyn TargetIsa, bnode: BladeNode) {
+fn _do_slh_on(func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNode) {
     match bnode {
         BladeNode::Sink(_) => panic!("Can't do SLH to protect a sink, have to protect a source"),
         BladeNode::ValueDef(value) => {
             // The value that needs protecting is `value`, so we need to apply SLH to the load which produced `value`
-            match func.dfg.value_def(value) {
+            match func.dfg.value_def(*value) {
                 ValueDef::Param(_, _) => unimplemented!("SLH on a block parameter"),
                 ValueDef::Result(inst, _) => {
                     assert!(func.dfg[inst].opcode().can_load(), "SLH on a non-load instruction: {:?}", func.dfg[inst]);
@@ -408,7 +396,7 @@ fn _do_slh_on(func: &mut Function, isa: &dyn TargetIsa, bnode: BladeNode) {
                         let flags = cur.ins().ifcmp(pointer_arg, bounds.lower);
                         let mask = cur.ins().selectif(pointer_ty, IntCC::UnsignedGreaterThanOrEqual, flags, all_ones, zero);
                         let op_size_bytes = {
-                            let bytes = cur.func.dfg.value_type(value).bytes() as u64;
+                            let bytes = cur.func.dfg.value_type(*value).bytes() as u64;
                             cur.ins().iconst(pointer_ty, bytes as i64)
                         };
                         let adjusted_upper_bound = cur.ins().isub(bounds.upper, op_size_bytes);
