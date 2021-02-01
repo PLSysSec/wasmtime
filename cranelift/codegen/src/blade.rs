@@ -1,7 +1,7 @@
 //! A pass over Cranelift IR which implements the Blade algorithm
 
 use crate::cursor::{Cursor, EncCursor};
-use crate::entity::SecondaryMap;
+use crate::entity::{EntitySet, SecondaryMap};
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::{condcodes::IntCC, dfg::Bounds, ArgumentPurpose, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef};
 use crate::isa::TargetIsa;
@@ -12,6 +12,7 @@ use rs_graph::maxflow::MaxFlow;
 use rs_graph::traits::{Directed, GraphSize};
 use rs_graph::Buildable;
 use rs_graph::Builder;
+use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
 use alloc::vec::Vec;
@@ -67,13 +68,13 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         } else {
             false
         };
-    let constant_addr_loads_are_srcs =
-        if isa.flags().blade_v1_1() {
-            true
-        } else {
-            false
-        };
-    let blade_graph = build_blade_graph_for_func(func, cfg, store_values_are_sinks, constant_addr_loads_are_srcs);
+    let sources = match (isa.flags().blade_type(), isa.flags().blade_v1_1()) {
+        (BladeType::SwitchbladeFenceA, false) => Sources::BCAddr,
+        (BladeType::SwitchbladeFenceA, true) => unimplemented!("switchblade_fence_a is not implemented for v1.1 yet"),
+        (_, false) => Sources::NonConstantAddr,
+        (_, true) => Sources::AllLoads,
+    };
+    let blade_graph = build_blade_graph_for_func(func, cfg, store_values_are_sinks, sources);
 
     // insert the fences / SLHs
     let mut slh_ctx = SLHContext::new();
@@ -101,7 +102,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                 );
             }
         }
-        BladeType::Lfence | BladeType::LfencePerBlock => {
+        BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA => {
             for cut_edge in blade_graph.min_cut() {
                 let edge_src = blade_graph.graph.src(cut_edge);
                 let edge_snk = blade_graph.graph.snk(cut_edge);
@@ -162,7 +163,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
 
     if PRINT_FENCE_COUNTS {
         match blade_type {
-            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence => {
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                 println!("function {}: inserted {} (static) lfences", func.name, fence_counts.static_fences_inserted);
                 assert_eq!(fence_counts.static_slhs_inserted, 0);
             }
@@ -183,7 +184,7 @@ fn insert_fence_before(func: &mut Function, bnode: &BladeNode, blade_type: Blade
         BladeNode::ValueDef(val) => match func.dfg.value_def(*val) {
             ValueDef::Result(inst, _) => {
                 match blade_type {
-                    BladeType::Lfence | BladeType::BaselineFence => {
+                    BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                         // cut at this value by putting lfence before `inst`
                         if func.pre_lfence[inst] {
                             // do nothing, already had a fence here
@@ -226,7 +227,7 @@ fn insert_fence_before(func: &mut Function, bnode: &BladeNode, blade_type: Blade
         },
         BladeNode::Sink(inst) => {
             match blade_type {
-                BladeType::Lfence | BladeType::BaselineFence => {
+                BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                     // cut at this instruction by putting lfence before it
                     if func.pre_lfence[*inst] {
                         // do nothing, already had a fence here
@@ -564,10 +565,11 @@ impl BladeGraph {
             .collect()
     }
 
-    /// Given a `Node`, iterate over all of the "source nodes" which have paths
-    /// to it, where "source node" is defined by `self.is_source_node`.
+    /// Given a `Node`, get a `HashSet` of all of the "source nodes" which have
+    /// paths to it, where "source node" is defined by `self.is_source_node()`.
     ///
-    /// If the given `node` is itself a "source node", we'll just return `node` itself
+    /// If the given `node` is itself a "source node", we'll return a set
+    /// containing just `node` itself
     fn ancestors_of(&self, node: Node<usize>) -> HashSet<Node<usize>> {
         self._ancestors_of(node, &mut HashSet::new())
     }
@@ -593,6 +595,134 @@ impl BladeGraph {
     /// it
     fn is_source_node(&self, node: Node<usize>) -> bool {
         self.graph.inedges(node).any(|(_, incoming)| incoming == self.source_node)
+    }
+}
+
+/// `SimpleCache` borrowed from the implementation in the crate
+/// [`llvm-ir-analysis`](https://crates.io/crates/llvm-ir-analysis)
+struct SimpleCache<T> {
+    /// `None` if not computed yet
+    data: RefCell<Option<T>>,
+}
+
+impl<T> SimpleCache<T> {
+    fn new() -> Self {
+        Self {
+            data: RefCell::new(None),
+        }
+    }
+
+    /// Get the cached value, or if no value is cached, compute the value using
+    /// the given closure, then cache that result and return it
+    fn get_or_insert_with(&self, f: impl FnOnce() -> T) -> Ref<T> {
+        // borrow mutably only if it's empty. else don't even try to borrow mutably
+        let need_mutable_borrow = self.data.borrow().is_none();
+        if need_mutable_borrow {
+            let old_val = self.data.borrow_mut().replace(f());
+            debug_assert!(old_val.is_none());
+        }
+        // now, either way, it's populated, so we borrow immutably and return.
+        // future users can also borrow immutably using this function (even
+        // while this borrow is still outstanding), since it won't try to borrow
+        // mutably in the future.
+        Ref::map(self.data.borrow(), |o| {
+            o.as_ref().expect("should be populated now")
+        })
+    }
+}
+
+/// Stores data about which values are BC-tainted
+struct BCData {
+    /// These nodes are BC-tainted
+    tainted_nodes: EntitySet<Value>,
+}
+
+impl BCData {
+    /// Determine which values in the given function are BC-tainted
+    fn new(func: &Function, def_use_graph: &DefUseGraph) -> Self {
+        // first we find the `roots`: values which are actually used as branch conditions
+        let roots = {
+            let mut roots = vec![];
+            for block in func.layout.blocks() {
+                for inst in func.layout.block_insts(block) {
+                    let idata = &func.dfg[inst];
+                    if idata.opcode().is_branch() {
+                        // is_branch() covers both conditional branches and indirect branches.
+                        // I'm not sure whether we want this or not, but for now we're conservative
+
+                        // `inst_fixed_args` gets the condition args for branches,
+                        //   and ignores the destination block params (which are also included in args)
+                        roots.extend(func.dfg.inst_fixed_args(inst));
+                    }
+                }
+            }
+            roots
+        };
+
+        // now the tainted values are:
+        //   - the roots
+        //   - any values which use the roots, including transitively, according to the `DefUseGraph`
+        //   - TODO: do we also need backwards taint tracking?  i.e. any values which contribute to the roots?
+        let mut tainted_nodes = EntitySet::with_capacity(func.dfg.num_values());
+
+        let mut worklist = roots;
+        loop {
+            match worklist.pop() {
+                None => break,
+                Some(item) => {
+                    // if the item is already tainted, then we've already processed it and its uses
+                    if tainted_nodes.contains(item) {
+                        // do nothing
+                    } else {
+                        // mark the item as tainted, which will also prevent us from processing this item again
+                        tainted_nodes.insert(item);
+                        // add all uses of the item to the worklist
+                        for v in def_use_graph.uses_of_val(item) {
+                            match *v {
+                                ValueUse::Inst(inst_use) => {
+                                    // add all the results of `inst` to the worklist
+                                    for &result in func.dfg.inst_results(inst_use) {
+                                        worklist.push(result);
+                                    }
+                                }
+                                ValueUse::Value(val_use) => {
+                                    worklist.push(val_use);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Self {
+            tainted_nodes,
+        }
+    }
+}
+
+/// Ensures that `BCData` is computed a maximum of once, and not at all if never
+/// needed
+struct CachedBCData<'a> {
+    /// The actual cache, from which we can get the `BCData` once it is computed
+    cache: SimpleCache<BCData>,
+    /// `func` for the purposes of computing the `BCData` the first time it is requested
+    func: &'a Function,
+    /// `def_use_graph` for the purposes of computing the `BCData` the first time it is requested
+    def_use_graph: &'a DefUseGraph,
+}
+
+impl<'a> CachedBCData<'a> {
+    fn new(func: &'a Function, def_use_graph: &'a DefUseGraph) -> Self {
+        Self {
+            cache: SimpleCache::new(),
+            func,
+            def_use_graph,
+        }
+    }
+
+    fn get(&self) -> Ref<BCData> {
+        self.cache.get_or_insert_with(|| BCData::new(self.func, self.def_use_graph))
     }
 }
 
@@ -676,6 +806,17 @@ impl BladeGraphBuilder {
     }
 }
 
+/// Which loads should be considered sources?
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sources {
+    /// All loads, including loads with constant addresses
+    AllLoads,
+    /// Only loads with non-constant addresses
+    NonConstantAddr,
+    /// Only loads with BC addresses. (No constants are BC, so this will be a subset of the loads with `NonConstantAddr`.)
+    BCAddr,
+}
+
 /// `store_values_are_sinks`: if `true`, then the value operand to a store
 /// instruction is considered a sink. if `false`, it is not.
 /// For instance in the instruction "store x to addrA", if
@@ -685,7 +826,7 @@ fn build_blade_graph_for_func(
     func: &mut Function,
     cfg: &ControlFlowGraph,
     store_values_are_sinks: bool,
-    constant_addr_loads_are_srcs: bool,
+    sources: Sources,
 ) -> BladeGraph {
     let mut builder = BladeGraphBuilder::with_nodes_for_func(func);
 
@@ -717,6 +858,7 @@ fn build_blade_graph_for_func(
             }
         }
     }
+    let bcdata = CachedBCData::new(func, &def_use_graph);
 
     // now we find sources and sinks, and add edges to/from our global source and sink nodes
     for block in func.layout.blocks() {
@@ -728,7 +870,16 @@ fn build_blade_graph_for_func(
                 // except for fills, which don't have sinks
 
                 // handle load as a source
-                if constant_addr_loads_are_srcs || !load_is_constant_addr(func, inst) {
+                let load_is_a_source = match sources {
+                    Sources::AllLoads => true,
+                    Sources::NonConstantAddr => !load_is_constant_addr(func, inst),
+                    Sources::BCAddr => {
+                        // address is BC if any of its components are
+                        let bcdata_ref = bcdata.get();
+                        func.dfg.inst_args(inst).iter().any(|&val| bcdata_ref.tainted_nodes.contains(val))
+                    }
+                };
+                if load_is_a_source {
                     for &result in func.dfg.inst_results(inst) {
                         builder.mark_as_source(result);
                     }
