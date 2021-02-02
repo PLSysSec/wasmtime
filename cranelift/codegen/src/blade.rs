@@ -24,7 +24,13 @@ pub(crate) const ALLOW_FAKE_SLH_BOUNDS: bool = true;
 /// `ALLOW_FAKE_SLH_BOUNDS` above)
 pub(crate) const FAKE_SLH_ARRAY_LENGTH_BYTES: u32 = 2345;
 
-const DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER: bool = false;
+/// Dump (to stdout) the Cranelift IR for each function before this pass
+const DEBUG_PRINT_FUNCTION_BEFORE: bool = false;
+/// Dump (to stdout) the Cranelift IR for each function after this pass
+const DEBUG_PRINT_FUNCTION_AFTER: bool = false;
+
+/// Print the detailed location of each fence/SLH as we insert it
+const DEBUG_PRINT_DETAILED_DEF_LOCATIONS: bool = false;
 
 /// Should we print the (static) count of fences/SLHs
 const PRINT_FENCE_COUNTS: bool = true;
@@ -48,7 +54,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         return;
     }
 
-    if DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER {
+    if DEBUG_PRINT_FUNCTION_BEFORE {
         println!("Function before blade:\n{}", func.display(isa));
     }
 
@@ -150,7 +156,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         BladeType::None => panic!("Shouldn't reach here with Blade setting None"),
     }
 
-    if DEBUG_PRINT_FUNCTION_BEFORE_AND_AFTER {
+    if DEBUG_PRINT_FUNCTION_AFTER {
         println!("Function after blade:\n{}", func.display(isa));
     }
 
@@ -182,6 +188,9 @@ fn insert_fence_before(func: &mut Function, bnode: &BladeNode, blade_type: Blade
                         if func.pre_lfence[inst] {
                             // do nothing, already had a fence here
                         } else {
+                            if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+                                println!("inserting fence before instruction {:?}", func.dfg[inst]);
+                            }
                             func.pre_lfence[inst] = true;
                             fence_counts.static_fences_inserted += 1;
                         }
@@ -207,6 +216,9 @@ fn insert_fence_before(func: &mut Function, bnode: &BladeNode, blade_type: Blade
                 if func.pre_lfence[first_inst] {
                     // do nothing, already had a fence there
                 } else {
+                    if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+                        println!("inserting fence before instruction {:?}", func.dfg[first_inst]);
+                    }
                     func.pre_lfence[first_inst] = true;
                     fence_counts.static_fences_inserted += 1;
                 }
@@ -219,6 +231,9 @@ fn insert_fence_before(func: &mut Function, bnode: &BladeNode, blade_type: Blade
                     if func.pre_lfence[*inst] {
                         // do nothing, already had a fence here
                     } else {
+                        if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+                            println!("inserting fence before instruction {:?}", func.dfg[*inst]);
+                        }
                         func.pre_lfence[*inst] = true;
                         fence_counts.static_fences_inserted += 1;
                     }
@@ -247,6 +262,9 @@ fn insert_fence_after(func: &mut Function, bnode: &BladeNode, blade_type: BladeT
                         if func.post_lfence[inst] {
                             // do nothing, already had a fence here
                         } else {
+                            if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+                                println!("inserting fence after instruction {:?}", func.dfg[inst]);
+                            }
                             func.post_lfence[inst] = true;
                             fence_counts.static_fences_inserted += 1;
                         }
@@ -272,6 +290,9 @@ fn insert_fence_after(func: &mut Function, bnode: &BladeNode, blade_type: BladeT
                 if func.pre_lfence[first_inst] {
                     // do nothing, already had a fence here
                 } else {
+                    if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+                        println!("inserting fence before instruction {:?}", func.dfg[first_inst]);
+                    }
                     func.pre_lfence[first_inst] = true;
                     fence_counts.static_fences_inserted += 1;
                 }
@@ -304,6 +325,9 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, fence_cou
             if func.pre_lfence[first_inst] {
                 // do nothing, already had a fence here
             } else {
+                if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+                    println!("inserting fence before instruction {:?}", func.dfg[first_inst]);
+                }
                 func.pre_lfence[first_inst] = true;
                 fence_counts.static_fences_inserted += 1;
             }
@@ -320,6 +344,9 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, fence_cou
             if func.post_lfence[cur_inst] {
                 // do nothing, already had a fence here
             } else {
+                if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+                    println!("inserting fence after instruction {:?}", func.dfg[cur_inst]);
+                }
                 func.post_lfence[cur_inst] = true;
                 fence_counts.static_fences_inserted += 1;
             }
@@ -359,6 +386,9 @@ fn _do_slh_on(func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNode) {
                 ValueDef::Param(_, _) => unimplemented!("SLH on a block parameter"),
                 ValueDef::Result(inst, _) => {
                     assert!(func.dfg[inst].opcode().can_load(), "SLH on a non-load instruction: {:?}", func.dfg[inst]);
+                    if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+                        println!("applying SLH to this load: {:?}", func.dfg[inst]);
+                    }
                     let mut cur = EncCursor::new(func, isa).at_inst(inst);
                     // Find the arguments to `inst` which are marked as pointers / have bounds
                     // (as pairs (argnum, argvalue))
