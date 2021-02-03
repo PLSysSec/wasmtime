@@ -446,6 +446,8 @@ fn _do_slh_on(func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNode) {
 struct DefUseGraph {
     /// Maps a value to its uses
     map: SecondaryMap<Value, Vec<ValueUse>>,
+    /// Inverse map: map a value to the values it uses
+    inverse_map: SecondaryMap<Value, Vec<Value>>,
 }
 
 impl DefUseGraph {
@@ -455,13 +457,20 @@ impl DefUseGraph {
     pub fn for_function(func: &Function, cfg: &ControlFlowGraph) -> Self {
         let mut map: SecondaryMap<Value, Vec<ValueUse>> =
             SecondaryMap::with_capacity(func.dfg.num_values());
+        let mut inverse_map: SecondaryMap<Value, Vec<Value>> =
+            SecondaryMap::with_capacity(func.dfg.num_values());
 
         for block in func.layout.blocks() {
             // Iterate over every instruction. Mark that instruction as a use of
             // each of its parameters.
+            // And mark the parameters as dependents of the instruction result(s).
             for inst in func.layout.block_insts(block) {
+                let results = func.dfg.inst_results(inst);
                 for arg in func.dfg.inst_args(inst) {
                     map[*arg].push(ValueUse::Inst(inst));
+                    for result in results {
+                        inverse_map[*result].push(*arg);
+                    }
                 }
             }
             // Also, mark each block parameter as a use of the corresponding argument
@@ -486,11 +495,15 @@ impl DefUseGraph {
                 assert_eq!(branch_args.len(), block_params.len());
                 for (param, arg) in block_params.iter().zip(branch_args.iter()) {
                     map[*arg].push(ValueUse::Value(*param));
+                    inverse_map[*param].push(*arg);
                 }
             }
         }
 
-        Self { map }
+        Self {
+            map,
+            inverse_map,
+        }
     }
 
     /// Iterate over all the uses of the given `Value`
@@ -510,6 +523,11 @@ impl DefUseGraph {
             .iter()
             .map(move |&val| self.uses_of_val(val))
             .flatten()
+    }
+
+    /// Iterate over all the values which a given `Value` uses
+    pub fn dependents_of_val(&self, val: Value) -> impl Iterator<Item = &Value> {
+        self.inverse_map[val].iter()
     }
 }
 
@@ -662,20 +680,25 @@ impl BCData {
         // now the tainted values are:
         //   - the roots
         //   - any values which use the roots, including transitively, according to the `DefUseGraph`
-        //   - TODO: do we also need backwards taint tracking?  i.e. any values which contribute to the roots?
-        let mut tainted_nodes = EntitySet::with_capacity(func.dfg.num_values());
+        //   - any (non-constant) values which contribute to the roots, including transitively, according to the `DefUseGraph`
+        //     (for justification why this backwards tracking is necessary: if the branch condition is
+        //     `i > 3`, then not only `i > 3` but also `i` need to be marked BC. More complicated examples
+        //     quickly justify applying this transitively.)
 
-        let mut worklist = roots;
+        // this loop processes "forward" taint tracking: all values which use
+        // the roots, including transitively
+        let mut forward_tainted_nodes = EntitySet::with_capacity(func.dfg.num_values());
+        let mut worklist = roots.clone();
         loop {
             match worklist.pop() {
                 None => break,
                 Some(item) => {
                     // if the item is already tainted, then we've already processed it and its uses
-                    if tainted_nodes.contains(item) {
+                    if forward_tainted_nodes.contains(item) {
                         // do nothing
                     } else {
                         // mark the item as tainted, which will also prevent us from processing this item again
-                        tainted_nodes.insert(item);
+                        forward_tainted_nodes.insert(item);
                         // add all uses of the item to the worklist
                         for v in def_use_graph.uses_of_val(item) {
                             match *v {
@@ -694,6 +717,35 @@ impl BCData {
                 }
             }
         }
+
+        // this loop processes "backward" taint tracking: all (non-constant)
+        // values which contribute to the roots, including transitively
+        let mut backward_tainted_nodes = EntitySet::with_capacity(func.dfg.num_values());
+        worklist = roots;
+        loop {
+            match worklist.pop() {
+                None => break,
+                Some(item) => {
+                    // if the item is already tainted, then we've already processed it and the values which contribute to it
+                    if backward_tainted_nodes.contains(item) {
+                        // do nothing
+                    } else {
+                        // mark the item as tainted, which will also prevent us from processing this item again
+                        backward_tainted_nodes.insert(item);
+                        // add all (non-constant) values which contribute to it to the worklist
+                        for v in def_use_graph.dependents_of_val(item).filter(|&v| !value_is_constant(func, *v)) {
+                            worklist.push(*v);
+                        }
+                    }
+                }
+            }
+        }
+
+        // now combine the forward and backward sets
+        for item in backward_tainted_nodes.keys() {
+            forward_tainted_nodes.insert(item);
+        }
+        let tainted_nodes = forward_tainted_nodes;
 
         Self {
             tainted_nodes,
