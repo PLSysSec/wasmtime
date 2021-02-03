@@ -36,22 +36,9 @@ const DEBUG_PRINT_DETAILED_DEF_LOCATIONS: bool = false;
 /// Should we print the (static) count of fences/SLHs
 const PRINT_FENCE_COUNTS: bool = true;
 
-struct FenceCounts {
-    static_fences_inserted: usize,
-    static_slhs_inserted: usize,
-}
-
-impl FenceCounts {
-    fn new() -> Self {
-        Self {
-            static_fences_inserted: 0,
-            static_slhs_inserted: 0,
-        }
-    }
-}
-
 pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph) {
-    if isa.flags().blade_type() == BladeType::None {
+    let blade_type = isa.flags().blade_type();
+    if blade_type == BladeType::None {
         return;
     }
 
@@ -59,103 +46,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         println!("Function before blade:\n{}", func.display(isa));
     }
 
-    let mut fence_counts = FenceCounts::new();
-
-    let store_values_are_sinks =
-        if isa.flags().blade_type() == BladeType::Slh && isa.flags().blade_v1_1() {
-            // For SLH to protect from v1.1, store values must be marked as sinks
-            true
-        } else {
-            false
-        };
-    let sources = match (isa.flags().blade_type(), isa.flags().blade_v1_1()) {
-        (BladeType::SwitchbladeFenceA, false) => Sources::BCAddr,
-        (BladeType::SwitchbladeFenceA, true) => unimplemented!("switchblade_fence_a is not implemented for v1.1 yet"),
-        (_, false) => Sources::NonConstantAddr,
-        (_, true) => Sources::AllLoads,
-    };
-    let blade_graph = build_blade_graph_for_func(func, cfg, store_values_are_sinks, sources);
-
-    // insert the fences / SLHs
-    let mut slh_ctx = SLHContext::new();
-    let blade_type = isa.flags().blade_type();
-    match blade_type {
-        BladeType::BaselineFence => {
-            for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
-                // insert a fence after every source
-                insert_fence_after(
-                    func,
-                    &blade_graph.node_to_bladenode_map[&source],
-                    blade_type,
-                    &mut fence_counts,
-                )
-            }
-        }
-        BladeType::BaselineSlh => {
-            for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
-                // use SLH on every source
-                slh_ctx.do_slh_on(
-                    func,
-                    isa,
-                    &blade_graph.node_to_bladenode_map[&source],
-                    &mut fence_counts,
-                );
-            }
-        }
-        BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA => {
-            for cut_edge in blade_graph.min_cut() {
-                let edge_src = blade_graph.graph.src(cut_edge);
-                let edge_snk = blade_graph.graph.snk(cut_edge);
-                if edge_src == blade_graph.source_node {
-                    // source -> n : fence after n
-                    insert_fence_after(
-                        func,
-                        &blade_graph.node_to_bladenode_map[&edge_snk],
-                        blade_type,
-                        &mut fence_counts,
-                    );
-                } else if edge_snk == blade_graph.sink_node {
-                    // n -> sink : fence before (def of) n
-                    insert_fence_before(
-                        func,
-                        &blade_graph.node_to_bladenode_map[&edge_src],
-                        blade_type,
-                        &mut fence_counts,
-                    );
-                } else {
-                    // n -> m : fence before m
-                    insert_fence_before(
-                        func,
-                        &blade_graph.node_to_bladenode_map[&edge_snk],
-                        blade_type,
-                        &mut fence_counts,
-                    );
-                }
-            }
-        }
-        BladeType::Slh => {
-            for cut_edge in blade_graph.min_cut() {
-                let edge_src = blade_graph.graph.src(cut_edge);
-                let edge_snk = blade_graph.graph.snk(cut_edge);
-                if edge_src == blade_graph.source_node {
-                    // source -> n : apply SLH to the instruction that produces n
-                    slh_ctx.do_slh_on(func, isa, &blade_graph.node_to_bladenode_map[&edge_snk], &mut fence_counts);
-                } else if edge_snk == blade_graph.sink_node {
-                    // n -> sink : for SLH we can't cut at n (which is a sink instruction), we have
-                    // to trace back through the graph and cut at all sources which lead to n
-                    for node in blade_graph.ancestors_of(edge_src) {
-                        slh_ctx.do_slh_on(func, isa, &blade_graph.node_to_bladenode_map[&node], &mut fence_counts);
-                    }
-                } else {
-                    // n -> m : likewise, apply SLH to all sources which lead to n
-                    for node in blade_graph.ancestors_of(edge_src) {
-                        slh_ctx.do_slh_on(func, isa, &blade_graph.node_to_bladenode_map[&node], &mut fence_counts);
-                    }
-                }
-            }
-        }
-        BladeType::None => panic!("Shouldn't reach here with Blade setting None"),
-    }
+    let fence_counts = BladePass::new(func, cfg, isa).run();
 
     if DEBUG_PRINT_FUNCTION_AFTER {
         println!("Function after blade:\n{}", func.display(isa));
@@ -175,6 +66,297 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                 assert_eq!(fence_counts.static_fences_inserted, 0);
                 assert_eq!(fence_counts.static_slhs_inserted, 0);
             }
+        }
+    }
+}
+
+/// All of the data we need to perform the Blade pass
+struct BladePass<'a> {
+    /// The function which we're performing the Blade pass on
+    func: &'a mut Function,
+    /// The CFG for that function
+    cfg: &'a ControlFlowGraph,
+    /// The def-use graph for that function (we compute this during `BladePass::new()`)
+    def_use_graph: DefUseGraph,
+    /// The `TargetIsa`
+    isa: &'a dyn TargetIsa,
+    /// The `BCData` for that function. `SimpleCache` ensures that we compute
+    /// this a maximum of once, and only if it is needed
+    bcdata: SimpleCache<BCData>,
+}
+
+impl<'a> BladePass<'a> {
+    fn new(func: &'a mut Function, cfg: &'a ControlFlowGraph, isa: &'a dyn TargetIsa) -> Self {
+        let def_use_graph = DefUseGraph::for_function(func, cfg);
+        Self {
+            func,
+            cfg,
+            def_use_graph,
+            isa,
+            bcdata: SimpleCache::new(),
+        }
+    }
+
+    fn get_bcdata(&self) -> Ref<BCData> {
+        self.bcdata.get_or_insert_with(|| BCData::new(self.func, &self.def_use_graph))
+    }
+
+    /// Run the Blade pass, inserting fences/SLHs as necessary, and return the
+    /// `FenceCounts` indicating how many of them were inserted
+    fn run(&mut self) -> FenceCounts {
+        let mut fence_counts = FenceCounts::new();
+        let blade_type = self.isa.flags().blade_type();
+        let blade_v1_1 = self.isa.flags().blade_v1_1();
+
+        let store_values_are_sinks =
+            if blade_type == BladeType::Slh && blade_v1_1 {
+                // For SLH to protect from v1.1, store values must be marked as sinks
+                true
+            } else {
+                false
+            };
+        let sources = match (blade_type, blade_v1_1) {
+            (BladeType::SwitchbladeFenceA, false) => Sources::BCAddr,
+            (BladeType::SwitchbladeFenceA, true) => unimplemented!("switchblade_fence_a is not implemented for v1.1 yet"),
+            (_, false) => Sources::NonConstantAddr,
+            (_, true) => Sources::AllLoads,
+        };
+        let blade_graph = self.build_blade_graph(store_values_are_sinks, sources);
+
+        // insert the fences / SLHs
+        let mut slh_ctx = SLHContext::new();
+        match blade_type {
+            BladeType::BaselineFence => {
+                for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
+                    // insert a fence after every source
+                    insert_fence_after(
+                        self.func,
+                        &blade_graph.node_to_bladenode_map[&source],
+                        blade_type,
+                        &mut fence_counts,
+                    )
+                }
+            }
+            BladeType::BaselineSlh => {
+                for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
+                    // use SLH on every source
+                    slh_ctx.do_slh_on(
+                        self.func,
+                        self.isa,
+                        &blade_graph.node_to_bladenode_map[&source],
+                        &mut fence_counts,
+                    );
+                }
+            }
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA => {
+                for cut_edge in blade_graph.min_cut() {
+                    let edge_src = blade_graph.graph.src(cut_edge);
+                    let edge_snk = blade_graph.graph.snk(cut_edge);
+                    if edge_src == blade_graph.source_node {
+                        // source -> n : fence after n
+                        insert_fence_after(
+                            self.func,
+                            &blade_graph.node_to_bladenode_map[&edge_snk],
+                            blade_type,
+                            &mut fence_counts,
+                        );
+                    } else if edge_snk == blade_graph.sink_node {
+                        // n -> sink : fence before (def of) n
+                        insert_fence_before(
+                            self.func,
+                            &blade_graph.node_to_bladenode_map[&edge_src],
+                            blade_type,
+                            &mut fence_counts,
+                        );
+                    } else {
+                        // n -> m : fence before m
+                        insert_fence_before(
+                            self.func,
+                            &blade_graph.node_to_bladenode_map[&edge_snk],
+                            blade_type,
+                            &mut fence_counts,
+                        );
+                    }
+                }
+            }
+            BladeType::Slh => {
+                for cut_edge in blade_graph.min_cut() {
+                    let edge_src = blade_graph.graph.src(cut_edge);
+                    let edge_snk = blade_graph.graph.snk(cut_edge);
+                    if edge_src == blade_graph.source_node {
+                        // source -> n : apply SLH to the instruction that produces n
+                        slh_ctx.do_slh_on(self.func, self.isa, &blade_graph.node_to_bladenode_map[&edge_snk], &mut fence_counts);
+                    } else if edge_snk == blade_graph.sink_node {
+                        // n -> sink : for SLH we can't cut at n (which is a sink instruction), we have
+                        // to trace back through the graph and cut at all sources which lead to n
+                        for node in blade_graph.ancestors_of(edge_src) {
+                            slh_ctx.do_slh_on(self.func, self.isa, &blade_graph.node_to_bladenode_map[&node], &mut fence_counts);
+                        }
+                    } else {
+                        // n -> m : likewise, apply SLH to all sources which lead to n
+                        for node in blade_graph.ancestors_of(edge_src) {
+                            slh_ctx.do_slh_on(self.func, self.isa, &blade_graph.node_to_bladenode_map[&node], &mut fence_counts);
+                        }
+                    }
+                }
+            }
+            BladeType::None => panic!("Shouldn't reach here with Blade setting None"),
+        }
+
+        fence_counts
+    }
+
+    /// `store_values_are_sinks`: if `true`, then the value operand to a store
+    /// instruction is considered a sink. if `false`, it is not.
+    /// For instance in the instruction "store x to addrA", if
+    /// `store_values_are_sinks` is `true`, then both `x` and `addrA` are sinks,
+    /// but if it is `false`, then just `addrA` is a sink.
+    fn build_blade_graph(&self, store_values_are_sinks: bool, sources: Sources) -> BladeGraph {
+        let mut builder = BladeGraphBuilder::with_nodes_for_func(self.func);
+
+        // first we add edges for actual data dependencies
+        // for instance in the following pseudocode:
+        //     x = load y
+        //     z = x + 2
+        //     branch on z
+        // we need an edge x -> z; that's what we're doing now
+        // later we will add other edges to mark sinks and sources
+        // (in this example, z -> sink and source -> x)
+        let def_use_graph = DefUseGraph::for_function(self.func, self.cfg);
+        for val in self.func.dfg.values() {
+            let node = builder.bladenode_to_node_map[&BladeNode::ValueDef(val)]; // must exist
+            for val_use in def_use_graph.uses_of_val(val) {
+                match *val_use {
+                    ValueUse::Inst(inst_use) => {
+                        // add an edge from val to the result of inst_use
+                        // TODO this assumes that all results depend on all operands;
+                        // are there any instructions where this is not the case for our purposes?
+                        for &result in self.func.dfg.inst_results(inst_use) {
+                            builder.add_edge_from_node_to_value(node, result);
+                        }
+                    }
+                    ValueUse::Value(val_use) => {
+                        // add an edge from val to val_use
+                        builder.add_edge_from_node_to_value(node, val_use);
+                    }
+                }
+            }
+        }
+
+        // now we find sources and sinks, and add edges to/from our global source and sink nodes
+        for block in self.func.layout.blocks() {
+            for inst in self.func.layout.block_insts(block) {
+                let idata = &self.func.dfg[inst];
+                let op = idata.opcode();
+                if op.can_load() {
+                    // loads are both sources (their loaded values) and sinks (their addresses)
+                    // except for fills, which don't have sinks
+
+                    // handle load as a source
+                    let load_is_a_source = match sources {
+                        Sources::AllLoads => true,
+                        Sources::NonConstantAddr => !load_is_constant_addr(self.func, inst),
+                        Sources::BCAddr => {
+                            // address is BC if any of its components are
+                            let bcdata_ref = self.get_bcdata();
+                            self.func.dfg.inst_args(inst).iter().any(|&val| bcdata_ref.tainted_nodes.contains(val))
+                        }
+                    };
+                    if load_is_a_source {
+                        for &result in self.func.dfg.inst_results(inst) {
+                            builder.mark_as_source(result);
+                        }
+                    }
+
+                    // handle load as a sink, except for fills
+                    if !(op == Opcode::Fill || op == Opcode::FillNop) {
+                        let inst_sink_node = builder.add_sink_node_for_inst(inst);
+                        // for each address component variable of inst,
+                        // add edge address_component_variable_node -> sink
+                        // XXX X86Pop has an implicit dependency on %rsp which is not captured here
+                        for &arg in self.func.dfg.inst_args(inst) {
+                            builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                        }
+                    }
+
+                } else if op.can_store() {
+                    // loads are both sources and sinks, but stores are just sinks
+
+                    let inst_sink_node = builder.add_sink_node_for_inst(inst);
+                    // similar to the load case above, but special treatment for the value being stored
+                    // XXX X86Push has an implicit dependency on %rsp which is not captured here
+                    if store_values_are_sinks {
+                        for &arg in self.func.dfg.inst_args(inst) {
+                            builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                        }
+                    } else {
+                        // SC: as far as I can tell, all stores (that have arguments) always
+                        //   have the value being stored as the first argument
+                        //   and everything after is address args
+                        for &arg in self.func.dfg.inst_args(inst).iter().skip(1) { // skip the first argument
+                            builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                        }
+                    };
+
+                } else if op.is_branch() {
+                    // conditional branches are sinks
+
+                    let inst_sink_node = builder.add_sink_node_for_inst(inst);
+
+                    // blade only does conditional branches but this will handle indirect jumps as well
+                    // `inst_fixed_args` gets the condition args for branches,
+                    //   and ignores the destination block params (which are also included in args)
+                    for &arg in self.func.dfg.inst_fixed_args(inst) {
+                        builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                    }
+
+                }
+                if op.is_call() {
+                    // to avoid interprocedural analysis, we require that function
+                    // arguments are stable, so we mark arguments to a call as sinks
+                    let inst_sink_node = builder.add_sink_node_for_inst(inst);
+                    for &arg in self.func.dfg.inst_args(inst) {
+                        builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                    }
+                }
+                if op.is_return() {
+                    // to avoid interprocedural analysis, we require that function
+                    // return values are stable, so we mark return values as sinks
+                    let inst_sink_node = builder.add_sink_node_for_inst(inst);
+                    for &arg in self.func.dfg.inst_args(inst) {
+                        builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                    }
+                }
+            }
+        }
+
+        // we no longer mark function parameters as transient, since we require that
+        // they are stable on the caller side (so this is commented)
+        /*
+        let entry_block = self.func
+            .layout
+            .entry_block()
+            .expect("Failed to find entry block");
+        for &func_param in self.func.dfg.block_params(entry_block) {
+            // parameters of the entry block == parameters of the function
+            builder.mark_as_source(func_param);
+        }
+        */
+
+        builder.build()
+    }
+}
+
+struct FenceCounts {
+    static_fences_inserted: usize,
+    static_slhs_inserted: usize,
+}
+
+impl FenceCounts {
+    fn new() -> Self {
+        Self {
+            static_fences_inserted: 0,
+            static_slhs_inserted: 0,
         }
     }
 }
@@ -753,31 +935,6 @@ impl BCData {
     }
 }
 
-/// Ensures that `BCData` is computed a maximum of once, and not at all if never
-/// needed
-struct CachedBCData<'a> {
-    /// The actual cache, from which we can get the `BCData` once it is computed
-    cache: SimpleCache<BCData>,
-    /// `func` for the purposes of computing the `BCData` the first time it is requested
-    func: &'a Function,
-    /// `def_use_graph` for the purposes of computing the `BCData` the first time it is requested
-    def_use_graph: &'a DefUseGraph,
-}
-
-impl<'a> CachedBCData<'a> {
-    fn new(func: &'a Function, def_use_graph: &'a DefUseGraph) -> Self {
-        Self {
-            cache: SimpleCache::new(),
-            func,
-            def_use_graph,
-        }
-    }
-
-    fn get(&self) -> Ref<BCData> {
-        self.cache.get_or_insert_with(|| BCData::new(self.func, self.def_use_graph))
-    }
-}
-
 struct BladeGraphBuilder {
     /// builder for the actual graph
     graph: <LinkedListGraph<usize> as rs_graph::Buildable>::Builder,
@@ -867,152 +1024,6 @@ enum Sources {
     NonConstantAddr,
     /// Only loads with BC addresses. (No constants are BC, so this will be a subset of the loads with `NonConstantAddr`.)
     BCAddr,
-}
-
-/// `store_values_are_sinks`: if `true`, then the value operand to a store
-/// instruction is considered a sink. if `false`, it is not.
-/// For instance in the instruction "store x to addrA", if
-/// `store_values_are_sinks` is `true`, then both `x` and `addrA` are sinks,
-/// but if it is `false`, then just `addrA` is a sink.
-fn build_blade_graph_for_func(
-    func: &mut Function,
-    cfg: &ControlFlowGraph,
-    store_values_are_sinks: bool,
-    sources: Sources,
-) -> BladeGraph {
-    let mut builder = BladeGraphBuilder::with_nodes_for_func(func);
-
-    // first we add edges for actual data dependencies
-    // for instance in the following pseudocode:
-    //     x = load y
-    //     z = x + 2
-    //     branch on z
-    // we need an edge x -> z; that's what we're doing now
-    // later we will add other edges to mark sinks and sources
-    // (in this example, z -> sink and source -> x)
-    let def_use_graph = DefUseGraph::for_function(func, cfg);
-    for val in func.dfg.values() {
-        let node = builder.bladenode_to_node_map[&BladeNode::ValueDef(val)]; // must exist
-        for val_use in def_use_graph.uses_of_val(val) {
-            match *val_use {
-                ValueUse::Inst(inst_use) => {
-                    // add an edge from val to the result of inst_use
-                    // TODO this assumes that all results depend on all operands;
-                    // are there any instructions where this is not the case for our purposes?
-                    for &result in func.dfg.inst_results(inst_use) {
-                        builder.add_edge_from_node_to_value(node, result);
-                    }
-                }
-                ValueUse::Value(val_use) => {
-                    // add an edge from val to val_use
-                    builder.add_edge_from_node_to_value(node, val_use);
-                }
-            }
-        }
-    }
-    let bcdata = CachedBCData::new(func, &def_use_graph);
-
-    // now we find sources and sinks, and add edges to/from our global source and sink nodes
-    for block in func.layout.blocks() {
-        for inst in func.layout.block_insts(block) {
-            let idata = &func.dfg[inst];
-            let op = idata.opcode();
-            if op.can_load() {
-                // loads are both sources (their loaded values) and sinks (their addresses)
-                // except for fills, which don't have sinks
-
-                // handle load as a source
-                let load_is_a_source = match sources {
-                    Sources::AllLoads => true,
-                    Sources::NonConstantAddr => !load_is_constant_addr(func, inst),
-                    Sources::BCAddr => {
-                        // address is BC if any of its components are
-                        let bcdata_ref = bcdata.get();
-                        func.dfg.inst_args(inst).iter().any(|&val| bcdata_ref.tainted_nodes.contains(val))
-                    }
-                };
-                if load_is_a_source {
-                    for &result in func.dfg.inst_results(inst) {
-                        builder.mark_as_source(result);
-                    }
-                }
-
-                // handle load as a sink, except for fills
-                if !(op == Opcode::Fill || op == Opcode::FillNop) {
-                    let inst_sink_node = builder.add_sink_node_for_inst(inst);
-                    // for each address component variable of inst,
-                    // add edge address_component_variable_node -> sink
-                    // XXX X86Pop has an implicit dependency on %rsp which is not captured here
-                    for &arg in func.dfg.inst_args(inst) {
-                        builder.add_edge_from_value_to_node(arg, inst_sink_node);
-                    }
-                }
-
-            } else if op.can_store() {
-                // loads are both sources and sinks, but stores are just sinks
-
-                let inst_sink_node = builder.add_sink_node_for_inst(inst);
-                // similar to the load case above, but special treatment for the value being stored
-                // XXX X86Push has an implicit dependency on %rsp which is not captured here
-                if store_values_are_sinks {
-                    for &arg in func.dfg.inst_args(inst) {
-                        builder.add_edge_from_value_to_node(arg, inst_sink_node);
-                    }
-                } else {
-                    // SC: as far as I can tell, all stores (that have arguments) always
-                    //   have the value being stored as the first argument
-                    //   and everything after is address args
-                    for &arg in func.dfg.inst_args(inst).iter().skip(1) { // skip the first argument
-                        builder.add_edge_from_value_to_node(arg, inst_sink_node);
-                    }
-                };
-
-            } else if op.is_branch() {
-                // conditional branches are sinks
-
-                let inst_sink_node = builder.add_sink_node_for_inst(inst);
-
-                // blade only does conditional branches but this will handle indirect jumps as well
-                // `inst_fixed_args` gets the condition args for branches,
-                //   and ignores the destination block params (which are also included in args)
-                for &arg in func.dfg.inst_fixed_args(inst) {
-                    builder.add_edge_from_value_to_node(arg, inst_sink_node);
-                }
-
-            }
-            if op.is_call() {
-                // to avoid interprocedural analysis, we require that function
-                // arguments are stable, so we mark arguments to a call as sinks
-                let inst_sink_node = builder.add_sink_node_for_inst(inst);
-                for &arg in func.dfg.inst_args(inst) {
-                    builder.add_edge_from_value_to_node(arg, inst_sink_node);
-                }
-            }
-            if op.is_return() {
-                // to avoid interprocedural analysis, we require that function
-                // return values are stable, so we mark return values as sinks
-                let inst_sink_node = builder.add_sink_node_for_inst(inst);
-                for &arg in func.dfg.inst_args(inst) {
-                    builder.add_edge_from_value_to_node(arg, inst_sink_node);
-                }
-            }
-        }
-    }
-
-    // we no longer mark function parameters as transient, since we require that
-    // they are stable on the caller side (so this is commented)
-    /*
-    let entry_block = func
-        .layout
-        .entry_block()
-        .expect("Failed to find entry block");
-    for &func_param in func.dfg.block_params(entry_block) {
-        // parameters of the entry block == parameters of the function
-        builder.mark_as_source(func_param);
-    }
-    */
-
-    builder.build()
 }
 
 /// Is the given `inst` (representing a load instruction) a constant-addr load
