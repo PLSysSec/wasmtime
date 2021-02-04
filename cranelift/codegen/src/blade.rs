@@ -946,8 +946,10 @@ impl BCData {
         }
 
         // now combine the forward and backward sets
-        for item in backward_tainted_nodes.keys() {
-            forward_tainted_nodes.insert(item);
+        // (is there a better way to iterate over an EntitySet than iterating
+        // over its keys and filtering for the ones it contains?)
+        for val in backward_tainted_nodes.keys().filter(|&val| backward_tainted_nodes.contains(val)) {
+            forward_tainted_nodes.insert(val);
         }
         let tainted_nodes = forward_tainted_nodes;
 
