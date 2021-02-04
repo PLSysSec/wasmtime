@@ -1087,6 +1087,7 @@ fn value_is_constant(func: &Function, value: Value) -> bool {
                 | Opcode::Bconst
                 | Opcode::Vconst
                 | Opcode::ConstAddr
+                | Opcode::JumpTableBase
                 | Opcode::Null
                 => true,
                 // addresses
@@ -1243,6 +1244,7 @@ fn value_is_constant(func: &Function, value: Value) -> bool {
                 | Opcode::IfcmpSp
                 | Opcode::Call
                 | Opcode::CallIndirect
+                | Opcode::JumpTableEntry
                 => false,
                 Opcode::Jump
                 | Opcode::Fallthrough
