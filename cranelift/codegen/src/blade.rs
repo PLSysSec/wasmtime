@@ -271,10 +271,9 @@ impl<'a> BladePass<'a> {
                 let idata = &self.func.dfg[inst];
                 let op = idata.opcode();
                 if op.can_load() {
-                    // loads are both sources (their loaded values) and sinks (their addresses)
-                    // except for fills, which don't have sinks
+                    // loads may be sources (their loaded values) and/or sinks (their addresses)
 
-                    // handle load as a source
+                    // handle load as a source, if necessary
                     let load_is_a_source = match sources {
                         Sources::AllLoads => true,
                         Sources::NonConstantAddr => !load_is_constant_addr(self.func, inst),
