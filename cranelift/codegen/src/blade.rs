@@ -244,10 +244,9 @@ impl<'a> BladePass<'a> {
         // we need an edge x -> z; that's what we're doing now
         // later we will add other edges to mark sinks and sources
         // (in this example, z -> sink and source -> x)
-        let def_use_graph = DefUseGraph::for_function(self.func, self.cfg);
         for val in self.func.dfg.values() {
             let node = builder.bladenode_to_node_map[&BladeNode::ValueDef(val)]; // must exist
-            for val_use in def_use_graph.uses_of_val(val) {
+            for val_use in self.def_use_graph.uses_of_val(val) {
                 match *val_use {
                     ValueUse::Inst(inst_use) => {
                         // add an edge from val to the result of inst_use
