@@ -112,13 +112,13 @@ impl<'a> BladePass<'a> {
             // Insert fences to ensure that function arguments and return values aren't BC
             let mut insts_needing_fences = vec![];
             let bcdata = self.get_bcdata();
-            println!("BC-tainted nodes: {:?}", bcdata.tainted_nodes.keys().filter(|&val| bcdata.tainted_nodes.contains(val)).collect::<Vec<Value>>());
+            println!("BC-tainted nodes: {:?}", bcdata.tainted_values.keys().filter(|&val| bcdata.tainted_values.contains(val)).collect::<Vec<Value>>());
             for block in self.func.layout.blocks() {
                 for inst in self.func.layout.block_insts(block) {
                     let opcode = self.func.dfg[inst].opcode();
                     if opcode.is_call() || opcode.is_return() {
                         // if any arguments to the call or return are BC, fence before the call or return
-                        if self.func.dfg.inst_args(inst).iter().any(|&arg| bcdata.tainted_nodes.contains(arg)) {
+                        if self.func.dfg.inst_args(inst).iter().any(|&arg| bcdata.tainted_values.contains(arg)) {
                             insts_needing_fences.push(inst);
                         }
                     }
@@ -280,8 +280,8 @@ impl<'a> BladePass<'a> {
                         Sources::NonConstantAddr => !load_is_constant_addr(self.func, inst),
                         Sources::BCAddr => {
                             // address is BC if any of its components are
-                            let bcdata_ref = self.get_bcdata();
-                            self.func.dfg.inst_args(inst).iter().any(|&val| bcdata_ref.tainted_nodes.contains(val))
+                            let bcdata = self.get_bcdata();
+                            self.func.dfg.inst_args(inst).iter().any(|&val| bcdata.tainted_values.contains(val))
                         }
                     };
                     if load_is_a_source {
@@ -855,65 +855,85 @@ impl<T> SimpleCache<T> {
 
 /// Stores data about which values are BC-tainted
 struct BCData {
-    /// These nodes are BC-tainted
-    tainted_nodes: EntitySet<Value>,
+    /// These values are BC-tainted
+    tainted_values: EntitySet<Value>,
 }
 
 impl BCData {
     /// Determine which values in the given function are BC-tainted
     fn new(func: &Function, def_use_graph: &DefUseGraph) -> Self {
-        // first we find the `roots`: values which are actually used as branch conditions
-        let roots = {
-            let mut roots = vec![];
+        // first we collect a list of all the values used as branch conditions
+        let branch_conditions = {
+            let mut branch_conditions = vec![];
             for block in func.layout.blocks() {
                 for inst in func.layout.block_insts(block) {
-                    let idata = &func.dfg[inst];
-                    if idata.opcode().is_branch() {
+                    if func.dfg[inst].opcode().is_branch() {
                         // is_branch() covers both conditional branches and indirect branches.
                         // I'm not sure whether we want this or not, but for now we're conservative
 
                         // `inst_fixed_args` gets the condition args for branches,
                         //   and ignores the destination block params (which are also included in args)
-                        roots.extend(func.dfg.inst_fixed_args(inst));
+                        branch_conditions.extend(func.dfg.inst_fixed_args(inst));
+                    }
+                }
+            }
+            branch_conditions
+        };
+
+        // now we find the `roots`: values which influence the branch conditions.
+        // Branch conditions are usually conditional expressions like `i > 3`. In
+        // this example, `i` is a root; that's what we're doing right now.
+        // (We need to trace backwards transitively in order to mark `i` a root in
+        // more complicated branch conditions like `(i + 3) / 7 > 56`.)
+        let roots = {
+            let mut roots = EntitySet::with_capacity(func.dfg.num_values());
+            let mut worklist = branch_conditions;  // we start by including all of the branch conditions themselves
+            loop {
+                match worklist.pop() {
+                    None => break,
+                    Some(val) => {
+                        // if the item is already marked as a root, then we've already processed it and the values which contribute to it
+                        if roots.contains(val) {
+                            // do nothing
+                        } else {
+                            // mark the item as a root, which will also prevent us from processing this item again
+                            roots.insert(val);
+                            // add all (non-constant) values which contribute to it to the worklist
+                            for v in def_use_graph.dependents_of_val(val).filter(|&v| !value_is_constant(func, *v)) {
+                                worklist.push(*v);
+                            }
+                        }
                     }
                 }
             }
             roots
         };
 
-        // now the tainted values are:
-        //   - the roots
-        //   - any values which use the roots, including transitively, according to the `DefUseGraph`
-        //   - any (non-constant) values which contribute to the roots, including transitively, according to the `DefUseGraph`
-        //     (for justification why this backwards tracking is necessary: if the branch condition is
-        //     `i > 3`, then not only `i > 3` but also `i` need to be marked BC. More complicated examples
-        //     quickly justify applying this transitively.)
-
-        // this loop processes "forward" taint tracking: all values which use
-        // the roots, including transitively
-        let mut forward_tainted_nodes = EntitySet::with_capacity(func.dfg.num_values());
-        let mut worklist = roots.clone();
+        // finally, BC-tainted values are defined as the roots and any values
+        // which use the roots, including transitively.
+        let mut tainted_values = EntitySet::with_capacity(func.dfg.num_values());
+        let mut worklist = roots;
         loop {
             match worklist.pop() {
                 None => break,
-                Some(item) => {
-                    // if the item is already tainted, then we've already processed it and its uses
-                    if forward_tainted_nodes.contains(item) {
+                Some(val) => {
+                    // if the value is already tainted, then we've already processed it and its uses
+                    if tainted_values.contains(val) {
                         // do nothing
                     } else {
-                        // mark the item as tainted, which will also prevent us from processing this item again
-                        forward_tainted_nodes.insert(item);
-                        // add all uses of the item to the worklist
-                        for v in def_use_graph.uses_of_val(item) {
+                        // mark the value as tainted, which will also prevent us from processing this value again
+                        tainted_values.insert(val);
+                        // add all uses of the value to the worklist
+                        for v in def_use_graph.uses_of_val(val) {
                             match *v {
                                 ValueUse::Inst(inst_use) => {
                                     // add all the results of `inst` to the worklist
                                     for &result in func.dfg.inst_results(inst_use) {
-                                        worklist.push(result);
+                                        worklist.insert(result);
                                     }
                                 }
                                 ValueUse::Value(val_use) => {
-                                    worklist.push(val_use);
+                                    worklist.insert(val_use);
                                 }
                             }
                         }
@@ -922,39 +942,8 @@ impl BCData {
             }
         }
 
-        // this loop processes "backward" taint tracking: all (non-constant)
-        // values which contribute to the roots, including transitively
-        let mut backward_tainted_nodes = EntitySet::with_capacity(func.dfg.num_values());
-        worklist = roots;
-        loop {
-            match worklist.pop() {
-                None => break,
-                Some(item) => {
-                    // if the item is already tainted, then we've already processed it and the values which contribute to it
-                    if backward_tainted_nodes.contains(item) {
-                        // do nothing
-                    } else {
-                        // mark the item as tainted, which will also prevent us from processing this item again
-                        backward_tainted_nodes.insert(item);
-                        // add all (non-constant) values which contribute to it to the worklist
-                        for v in def_use_graph.dependents_of_val(item).filter(|&v| !value_is_constant(func, *v)) {
-                            worklist.push(*v);
-                        }
-                    }
-                }
-            }
-        }
-
-        // now combine the forward and backward sets
-        // (is there a better way to iterate over an EntitySet than iterating
-        // over its keys and filtering for the ones it contains?)
-        for val in backward_tainted_nodes.keys().filter(|&val| backward_tainted_nodes.contains(val)) {
-            forward_tainted_nodes.insert(val);
-        }
-        let tainted_nodes = forward_tainted_nodes;
-
         Self {
-            tainted_nodes,
+            tainted_values,
         }
     }
 }
