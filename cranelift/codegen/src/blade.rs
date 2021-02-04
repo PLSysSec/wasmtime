@@ -86,7 +86,7 @@ struct BladePass<'a> {
 }
 
 impl<'a> BladePass<'a> {
-    fn new(func: &'a mut Function, cfg: &'a ControlFlowGraph, isa: &'a dyn TargetIsa) -> Self {
+    pub fn new(func: &'a mut Function, cfg: &'a ControlFlowGraph, isa: &'a dyn TargetIsa) -> Self {
         let def_use_graph = DefUseGraph::for_function(func, cfg);
         Self {
             func,
@@ -103,10 +103,32 @@ impl<'a> BladePass<'a> {
 
     /// Run the Blade pass, inserting fences/SLHs as necessary, and return the
     /// `FenceCounts` indicating how many of them were inserted
-    fn run(&mut self) -> FenceCounts {
+    pub fn run(&mut self) -> FenceCounts {
         let mut fence_counts = FenceCounts::new();
         let blade_type = self.isa.flags().blade_type();
         let blade_v1_1 = self.isa.flags().blade_v1_1();
+
+        if blade_type == BladeType::SwitchbladeFenceA {
+            // Insert fences to ensure that function arguments and return values aren't BC
+            let mut insts_needing_fences = vec![];
+            let bcdata = self.get_bcdata();
+            println!("BC-tainted nodes: {:?}", bcdata.tainted_nodes.keys().filter(|&val| bcdata.tainted_nodes.contains(val)).collect::<Vec<Value>>());
+            for block in self.func.layout.blocks() {
+                for inst in self.func.layout.block_insts(block) {
+                    let opcode = self.func.dfg[inst].opcode();
+                    if opcode.is_call() || opcode.is_return() {
+                        // if any arguments to the call or return are BC, fence before the call or return
+                        if self.func.dfg.inst_args(inst).iter().any(|&arg| bcdata.tainted_nodes.contains(arg)) {
+                            insts_needing_fences.push(inst);
+                        }
+                    }
+                }
+            }
+            std::mem::drop(bcdata);  // drops the borrow of self, so we can borrow it mutably to insert fences
+            for inst in insts_needing_fences {
+                insert_fence_before(self.func, &BladeNode::Sink(inst), blade_type, &mut fence_counts);
+            }
+        }
 
         let store_values_are_sinks =
             if blade_type == BladeType::Slh && blade_v1_1 {
