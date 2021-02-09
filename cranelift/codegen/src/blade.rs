@@ -460,7 +460,7 @@ fn insert_fence_after(func: &mut Function, bnode: &BladeNode, blade_type: BladeT
         BladeNode::ValueDef(val) => match func.dfg.value_def(*val) {
             ValueDef::Result(inst, _) => {
                 match blade_type {
-                    BladeType::Lfence | BladeType::BaselineFence => {
+                    BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                         // cut at this value by putting lfence after `inst`
                         if func.post_lfence[inst] {
                             // do nothing, already had a fence here
