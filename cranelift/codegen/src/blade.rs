@@ -33,6 +33,10 @@ const DEBUG_PRINT_FUNCTION_AFTER: bool = false;
 /// Print the detailed location of each fence/SLH as we insert it
 const DEBUG_PRINT_DETAILED_DEF_LOCATIONS: bool = false;
 
+/// Print the list of all BC-tainted nodes in the function.
+/// This only has an effect under Switchblade strategies.
+const DEBUG_PRINT_BC_NODES: bool = false;
+
 /// Should we print the (static) count of fences/SLHs
 const PRINT_FENCE_COUNTS: bool = true;
 
@@ -112,7 +116,9 @@ impl<'a> BladePass<'a> {
             // Insert fences to ensure that function arguments and return values aren't BC
             let mut insts_needing_fences = vec![];
             let bcdata = self.get_bcdata();
-            println!("BC-tainted nodes: {:?}", bcdata.tainted_values.keys().filter(|&val| bcdata.tainted_values.contains(val)).collect::<Vec<Value>>());
+            if DEBUG_PRINT_BC_NODES {
+                println!("BC-tainted nodes: {:?}", bcdata.tainted_values.keys().filter(|&val| bcdata.tainted_values.contains(val)).collect::<Vec<Value>>());
+            }
             for block in self.func.layout.blocks() {
                 for inst in self.func.layout.block_insts(block) {
                     let opcode = self.func.dfg[inst].opcode();
