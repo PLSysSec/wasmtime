@@ -146,7 +146,6 @@ impl<'a> BladePass<'a> {
         let blade_graph = self.build_blade_graph(store_values_are_sinks, sources);
 
         // insert the fences / SLHs
-        let mut slh_ctx = SLHContext::new();
         match blade_type {
             BladeType::BaselineFence => {
                 for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
@@ -160,14 +159,10 @@ impl<'a> BladePass<'a> {
                 }
             }
             BladeType::BaselineSlh => {
+                let mut slh_inserter = SLHInserter::new(self.func, self.isa, &mut fence_counts);
                 for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
                     // use SLH on every source
-                    slh_ctx.do_slh_on(
-                        self.func,
-                        self.isa,
-                        &blade_graph.node_to_bladenode_map[&source],
-                        &mut fence_counts,
-                    );
+                    slh_inserter.do_slh_on(&blade_graph.node_to_bladenode_map[&source]);
                 }
             }
             BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA => {
@@ -202,22 +197,23 @@ impl<'a> BladePass<'a> {
                 }
             }
             BladeType::Slh => {
+                let mut slh_inserter = SLHInserter::new(self.func, self.isa, &mut fence_counts);
                 for cut_edge in blade_graph.min_cut() {
                     let edge_src = blade_graph.graph.src(cut_edge);
                     let edge_snk = blade_graph.graph.snk(cut_edge);
                     if edge_src == blade_graph.source_node {
                         // source -> n : apply SLH to the instruction that produces n
-                        slh_ctx.do_slh_on(self.func, self.isa, &blade_graph.node_to_bladenode_map[&edge_snk], &mut fence_counts);
+                        slh_inserter.do_slh_on(&blade_graph.node_to_bladenode_map[&edge_snk]);
                     } else if edge_snk == blade_graph.sink_node {
                         // n -> sink : for SLH we can't cut at n (which is a sink instruction), we have
                         // to trace back through the graph and cut at all sources which lead to n
                         for node in blade_graph.ancestors_of(edge_src) {
-                            slh_ctx.do_slh_on(self.func, self.isa, &blade_graph.node_to_bladenode_map[&node], &mut fence_counts);
+                            slh_inserter.do_slh_on(&blade_graph.node_to_bladenode_map[&node]);
                         }
                     } else {
                         // n -> m : likewise, apply SLH to all sources which lead to n
                         for node in blade_graph.ancestors_of(edge_src) {
-                            slh_ctx.do_slh_on(self.func, self.isa, &blade_graph.node_to_bladenode_map[&node], &mut fence_counts);
+                            slh_inserter.do_slh_on(&blade_graph.node_to_bladenode_map[&node]);
                         }
                     }
                 }
@@ -528,24 +524,33 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, fence_cou
     }
 }
 
-struct SLHContext {
+struct SLHInserter<'a> {
+    /// The function we're inserting SLHs into
+    func: &'a mut Function,
+    /// The `TargetIsa`
+    isa: &'a dyn TargetIsa,
     /// tracks which `BladeNode`s have already had SLH applied to them
     bladenodes_done: HashSet<BladeNode>,
+    /// the `FenceCounts` where we record how many SLHs we're inserting
+    fence_counts: &'a mut FenceCounts,
 }
 
-impl SLHContext {
-    /// A blank SLHContext
-    fn new() -> Self {
+impl<'a> SLHInserter<'a> {
+    /// A blank SLHInserter
+    fn new(func: &'a mut Function, isa: &'a dyn TargetIsa, fence_counts: &'a mut FenceCounts) -> Self {
         Self {
+            func,
+            isa,
             bladenodes_done: HashSet::new(),
+            fence_counts,
         }
     }
 
     /// Do SLH on `bnode`, but only if we haven't already done SLH on `bnode`
-    fn do_slh_on(&mut self, func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNode, fence_counts: &mut FenceCounts) {
+    fn do_slh_on(&mut self, bnode: &BladeNode) {
         if self.bladenodes_done.insert(bnode.clone()) {
-            _do_slh_on(func, isa, bnode);
-            fence_counts.static_slhs_inserted += 1;
+            _do_slh_on(self.func, self.isa, bnode);
+            self.fence_counts.static_slhs_inserted += 1;
         }
     }
 }
