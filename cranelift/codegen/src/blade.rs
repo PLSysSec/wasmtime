@@ -162,7 +162,7 @@ impl<'a> BladePass<'a> {
                 let mut slh_inserter = SLHInserter::new(self.func, self.isa, &mut fence_counts);
                 for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
                     // use SLH on every source
-                    slh_inserter.do_slh_on(&blade_graph.node_to_bladenode_map[&source]);
+                    slh_inserter.apply_slh_to_bnode(&blade_graph.node_to_bladenode_map[&source]);
                 }
             }
             BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA => {
@@ -203,17 +203,17 @@ impl<'a> BladePass<'a> {
                     let edge_snk = blade_graph.graph.snk(cut_edge);
                     if edge_src == blade_graph.source_node {
                         // source -> n : apply SLH to the instruction that produces n
-                        slh_inserter.do_slh_on(&blade_graph.node_to_bladenode_map[&edge_snk]);
+                        slh_inserter.apply_slh_to_bnode(&blade_graph.node_to_bladenode_map[&edge_snk]);
                     } else if edge_snk == blade_graph.sink_node {
                         // n -> sink : for SLH we can't cut at n (which is a sink instruction), we have
                         // to trace back through the graph and cut at all sources which lead to n
                         for node in blade_graph.ancestors_of(edge_src) {
-                            slh_inserter.do_slh_on(&blade_graph.node_to_bladenode_map[&node]);
+                            slh_inserter.apply_slh_to_bnode(&blade_graph.node_to_bladenode_map[&node]);
                         }
                     } else {
                         // n -> m : likewise, apply SLH to all sources which lead to n
                         for node in blade_graph.ancestors_of(edge_src) {
-                            slh_inserter.do_slh_on(&blade_graph.node_to_bladenode_map[&node]);
+                            slh_inserter.apply_slh_to_bnode(&blade_graph.node_to_bladenode_map[&node]);
                         }
                     }
                 }
@@ -546,16 +546,16 @@ impl<'a> SLHInserter<'a> {
         }
     }
 
-    /// Do SLH on `bnode`, but only if we haven't already done SLH on `bnode`
-    fn do_slh_on(&mut self, bnode: &BladeNode) {
+    /// Apply SLH to `bnode`, but only if we haven't already applied SLH to `bnode`
+    fn apply_slh_to_bnode(&mut self, bnode: &BladeNode) {
         if self.bladenodes_done.insert(bnode.clone()) {
-            _do_slh_on(self.func, self.isa, bnode);
+            _apply_slh_to_bnode(self.func, self.isa, bnode);
             self.fence_counts.static_slhs_inserted += 1;
         }
     }
 }
 
-fn _do_slh_on(func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNode) {
+fn _apply_slh_to_bnode(func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNode) {
     match bnode {
         BladeNode::Sink(_) => panic!("Can't do SLH to protect a sink, have to protect a source"),
         BladeNode::ValueDef(value) => {
@@ -563,61 +563,69 @@ fn _do_slh_on(func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNode) {
             match func.dfg.value_def(*value) {
                 ValueDef::Param(_, _) => unimplemented!("SLH on a block parameter"),
                 ValueDef::Result(inst, _) => {
-                    assert!(func.dfg[inst].opcode().can_load(), "SLH on a non-load instruction: {:?}", func.dfg[inst]);
-                    if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
-                        println!("applying SLH to this load: {:?}", func.dfg[inst]);
-                    }
-                    let mut cur = EncCursor::new(func, isa).at_inst(inst);
-                    // Find the arguments to `inst` which are marked as pointers / have bounds
-                    // (as pairs (argnum, argvalue))
-                    let mut pointer_args = cur.func.dfg.inst_args(inst).iter().copied().enumerate().filter(|&(_, arg)| cur.func.dfg.bounds[arg].is_some());
-                    let (pointer_arg_num, pointer_arg, bounds) = match pointer_args.next() {
-                        Some((num, arg)) => match pointer_args.next() {
-                            Some(_) => panic!("SLH: multiple pointer args found to instruction {:?}", func.dfg[inst]),
-                            None => {
-                                // all good, there is exactly one pointer arg
-                                let bounds = cur.func.dfg.bounds[arg].clone().expect("we already checked that there's bounds here");
-                                (num, arg, bounds)
-                            }
-                        }
-                        None => {
-                            if ALLOW_FAKE_SLH_BOUNDS {
-                                let pointer_arg_num = 0; // we pick the first arg, arbitrarily
-                                let pointer_arg = cur.func.dfg.inst_args(inst)[pointer_arg_num];
-                                let lower = pointer_arg;
-                                let upper = cur.ins().iadd_imm(pointer_arg, (FAKE_SLH_ARRAY_LENGTH_BYTES as u64) as i64);
-                                let bounds = Bounds {
-                                    lower,
-                                    upper,
-                                    directly_annotated: false,
-                                };
-                                (pointer_arg_num, pointer_arg, bounds)
-                            } else {
-                                panic!("SLH: no pointer arg found for instruction {:?}", func.dfg[inst])
-                            }
-                        }
-                    };
-                    let masked_pointer = {
-                        let pointer_ty = cur.func.dfg.value_type(pointer_arg);
-                        let zero = cur.ins().iconst(pointer_ty, 0);
-                        let all_ones = cur.ins().iconst(pointer_ty, -1);
-                        let flags = cur.ins().ifcmp(pointer_arg, bounds.lower);
-                        let mask = cur.ins().selectif(pointer_ty, IntCC::UnsignedGreaterThanOrEqual, flags, all_ones, zero);
-                        let op_size_bytes = {
-                            let bytes = cur.func.dfg.value_type(*value).bytes() as u64;
-                            cur.ins().iconst(pointer_ty, bytes as i64)
-                        };
-                        let adjusted_upper_bound = cur.ins().isub(bounds.upper, op_size_bytes);
-                        let flags = cur.ins().ifcmp(pointer_arg, adjusted_upper_bound);
-                        let mask = cur.ins().selectif(pointer_ty, IntCC::UnsignedLessThanOrEqual, flags, mask, zero);
-                        cur.ins().band(pointer_arg, mask)
-                    };
-                    // now update the original load instruction to use the masked pointer instead
-                    cur.func.dfg.inst_args_mut(inst)[pointer_arg_num] = masked_pointer;
+                    apply_slh_to_load_inst(func, isa, inst);
                 }
             }
         }
     }
+}
+
+/// Expects `inst` to be a load instruction, and panics if it is not
+fn apply_slh_to_load_inst(func: &mut Function, isa: &dyn TargetIsa, inst: Inst) {
+    assert!(func.dfg[inst].opcode().can_load(), "SLH on a non-load instruction: {:?}", func.dfg[inst]);
+    if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+        println!("applying SLH to this load: {:?}", func.dfg[inst]);
+    }
+    let mut cur = EncCursor::new(func, isa).at_inst(inst);
+    // Find the arguments to `inst` which are marked as pointers / have bounds
+    // (as pairs (argnum, argvalue))
+    let mut pointer_args = cur.func.dfg.inst_args(inst).iter().copied().enumerate().filter(|&(_, arg)| cur.func.dfg.bounds[arg].is_some());
+    let (pointer_arg_num, pointer_arg, bounds) = match pointer_args.next() {
+        Some((num, arg)) => match pointer_args.next() {
+            Some(_) => panic!("SLH: multiple pointer args found to instruction {:?}", func.dfg[inst]),
+            None => {
+                // all good, there is exactly one pointer arg
+                let bounds = cur.func.dfg.bounds[arg].clone().expect("we already checked that there's bounds here");
+                (num, arg, bounds)
+            }
+        }
+        None => {
+            if ALLOW_FAKE_SLH_BOUNDS {
+                let pointer_arg_num = 0; // we pick the first arg, arbitrarily
+                let pointer_arg = cur.func.dfg.inst_args(inst)[pointer_arg_num];
+                let lower = pointer_arg;
+                let upper = cur.ins().iadd_imm(pointer_arg, (FAKE_SLH_ARRAY_LENGTH_BYTES as u64) as i64);
+                let bounds = Bounds {
+                    lower,
+                    upper,
+                    directly_annotated: false,
+                };
+                (pointer_arg_num, pointer_arg, bounds)
+            } else {
+                panic!("SLH: no pointer arg found for instruction {:?}", func.dfg[inst])
+            }
+        }
+    };
+    let masked_pointer = {
+        let pointer_ty = cur.func.dfg.value_type(pointer_arg);
+        let zero = cur.ins().iconst(pointer_ty, 0);
+        let all_ones = cur.ins().iconst(pointer_ty, -1);
+        let flags = cur.ins().ifcmp(pointer_arg, bounds.lower);
+        let mask = cur.ins().selectif(pointer_ty, IntCC::UnsignedGreaterThanOrEqual, flags, all_ones, zero);
+        let op_size_bytes = {
+            let results = cur.func.dfg.inst_results(inst);
+            assert_eq!(results.len(), 1, "expected load instruction to have exactly one result, got {}", results.len());
+            let result = results[0];
+            let bytes = cur.func.dfg.value_type(result).bytes() as u64;
+            cur.ins().iconst(pointer_ty, bytes as i64)
+        };
+        let adjusted_upper_bound = cur.ins().isub(bounds.upper, op_size_bytes);
+        let flags = cur.ins().ifcmp(pointer_arg, adjusted_upper_bound);
+        let mask = cur.ins().selectif(pointer_ty, IntCC::UnsignedLessThanOrEqual, flags, mask, zero);
+        cur.ins().band(pointer_arg, mask)
+    };
+    // now update the original load instruction to use the masked pointer instead
+    cur.func.dfg.inst_args_mut(inst)[pointer_arg_num] = masked_pointer;
 }
 
 struct DefUseGraph {
