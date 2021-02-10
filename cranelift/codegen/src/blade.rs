@@ -125,8 +125,9 @@ impl<'a> BladePass<'a> {
                 }
             }
             std::mem::drop(bcdata);  // drops the borrow of self, so we can borrow it mutably to insert fences
+            let mut fence_inserter = FenceInserter::new(self.func, blade_type, &mut fence_counts);
             for inst in insts_needing_fences {
-                insert_fence_before(self.func, &BladeNode::Sink(inst), blade_type, &mut fence_counts);
+                fence_inserter.insert_fence_before(&BladeNode::Sink(inst));
             }
         }
 
@@ -148,14 +149,10 @@ impl<'a> BladePass<'a> {
         // insert the fences / SLHs
         match blade_type {
             BladeType::BaselineFence => {
+                let mut fence_inserter = FenceInserter::new(self.func, blade_type, &mut fence_counts);
                 for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
                     // insert a fence after every source
-                    insert_fence_after(
-                        self.func,
-                        &blade_graph.node_to_bladenode_map[&source],
-                        blade_type,
-                        &mut fence_counts,
-                    )
+                    fence_inserter.insert_fence_after(&blade_graph.node_to_bladenode_map[&source]);
                 }
             }
             BladeType::BaselineSlh => {
@@ -166,33 +163,19 @@ impl<'a> BladePass<'a> {
                 }
             }
             BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA => {
+                let mut fence_inserter = FenceInserter::new(self.func, blade_type, &mut fence_counts);
                 for cut_edge in blade_graph.min_cut() {
                     let edge_src = blade_graph.graph.src(cut_edge);
                     let edge_snk = blade_graph.graph.snk(cut_edge);
                     if edge_src == blade_graph.source_node {
                         // source -> n : fence after n
-                        insert_fence_after(
-                            self.func,
-                            &blade_graph.node_to_bladenode_map[&edge_snk],
-                            blade_type,
-                            &mut fence_counts,
-                        );
+                        fence_inserter.insert_fence_after(&blade_graph.node_to_bladenode_map[&edge_snk]);
                     } else if edge_snk == blade_graph.sink_node {
                         // n -> sink : fence before (def of) n
-                        insert_fence_before(
-                            self.func,
-                            &blade_graph.node_to_bladenode_map[&edge_src],
-                            blade_type,
-                            &mut fence_counts,
-                        );
+                        fence_inserter.insert_fence_before(&blade_graph.node_to_bladenode_map[&edge_src]);
                     } else {
                         // n -> m : fence before m
-                        insert_fence_before(
-                            self.func,
-                            &blade_graph.node_to_bladenode_map[&edge_snk],
-                            blade_type,
-                            &mut fence_counts,
-                        );
+                        fence_inserter.insert_fence_before(&blade_graph.node_to_bladenode_map[&edge_snk]);
                     }
                 }
             }
@@ -377,87 +360,106 @@ impl FenceCounts {
     }
 }
 
-fn insert_fence_before(func: &mut Function, bnode: &BladeNode, blade_type: BladeType, fence_counts: &mut FenceCounts) {
-    match bnode {
-        BladeNode::ValueDef(val) => match func.dfg.value_def(*val) {
-            ValueDef::Result(inst, _) => {
-                match blade_type {
+struct FenceInserter<'a> {
+    /// The function we're inserting fences into
+    func: &'a mut Function,
+    /// the `BladeType`
+    blade_type: BladeType,
+    /// the `FenceCounts` where we record how many fences we're inserting
+    fence_counts: &'a mut FenceCounts,
+}
+
+impl<'a> FenceInserter<'a> {
+    fn new(func: &'a mut Function, blade_type: BladeType, fence_counts: &'a mut FenceCounts) -> Self {
+        Self {
+            func,
+            blade_type,
+            fence_counts,
+        }
+    }
+
+    fn insert_fence_before(&mut self, bnode: &BladeNode) {
+        match bnode {
+            BladeNode::ValueDef(val) => match self.func.dfg.value_def(*val) {
+                ValueDef::Result(inst, _) => {
+                    match self.blade_type {
+                        BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
+                            // cut at this value by putting lfence before `inst`
+                            insert_fence_before_inst(self.func, inst, self.fence_counts);
+                        }
+                        BladeType::LfencePerBlock => {
+                            // just put one fence at the beginning of the block.
+                            // this stops speculation due to branch mispredictions.
+                            insert_fence_at_beginning_of_block(self.func, inst, self.fence_counts);
+                        }
+                        _ => panic!(
+                            "This function didn't expect to be called with blade_type {:?}",
+                            self.blade_type
+                        ),
+                    }
+                }
+                ValueDef::Param(block, _) => {
+                    // cut at this value by putting lfence at beginning of
+                    // the `block`, that is, before the first instruction
+                    let first_inst = self.func
+                        .layout
+                        .first_inst(block)
+                        .expect("block has no instructions");
+                    insert_fence_before_inst(self.func, first_inst, self.fence_counts);
+                }
+            },
+            BladeNode::Sink(inst) => {
+                match self.blade_type {
                     BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
-                        // cut at this value by putting lfence before `inst`
-                        insert_fence_before_inst(func, inst, fence_counts);
+                        // cut at this instruction by putting lfence before it
+                        insert_fence_before_inst(self.func, *inst, self.fence_counts);
                     }
                     BladeType::LfencePerBlock => {
                         // just put one fence at the beginning of the block.
                         // this stops speculation due to branch mispredictions.
-                        insert_fence_at_beginning_of_block(func, inst, fence_counts);
+                        insert_fence_at_beginning_of_block(self.func, *inst, self.fence_counts);
                     }
                     _ => panic!(
                         "This function didn't expect to be called with blade_type {:?}",
-                        blade_type
+                        self.blade_type
                     ),
                 }
-            }
-            ValueDef::Param(block, _) => {
-                // cut at this value by putting lfence at beginning of
-                // the `block`, that is, before the first instruction
-                let first_inst = func
-                    .layout
-                    .first_inst(block)
-                    .expect("block has no instructions");
-                insert_fence_before_inst(func, first_inst, fence_counts);
-            }
-        },
-        BladeNode::Sink(inst) => {
-            match blade_type {
-                BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
-                    // cut at this instruction by putting lfence before it
-                    insert_fence_before_inst(func, *inst, fence_counts);
-                }
-                BladeType::LfencePerBlock => {
-                    // just put one fence at the beginning of the block.
-                    // this stops speculation due to branch mispredictions.
-                    insert_fence_at_beginning_of_block(func, *inst, fence_counts);
-                }
-                _ => panic!(
-                    "This function didn't expect to be called with blade_type {:?}",
-                    blade_type
-                ),
             }
         }
     }
-}
 
-fn insert_fence_after(func: &mut Function, bnode: &BladeNode, blade_type: BladeType, fence_counts: &mut FenceCounts) {
-    match bnode {
-        BladeNode::ValueDef(val) => match func.dfg.value_def(*val) {
-            ValueDef::Result(inst, _) => {
-                match blade_type {
-                    BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
-                        // cut at this value by putting lfence after `inst`
-                        insert_fence_after_inst(func, inst, fence_counts);
+    fn insert_fence_after(&mut self, bnode: &BladeNode) {
+        match bnode {
+            BladeNode::ValueDef(val) => match self.func.dfg.value_def(*val) {
+                ValueDef::Result(inst, _) => {
+                    match self.blade_type {
+                        BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
+                            // cut at this value by putting lfence after `inst`
+                            insert_fence_after_inst(self.func, inst, self.fence_counts);
+                        }
+                        BladeType::LfencePerBlock => {
+                            // just put one fence at the beginning of the block.
+                            // this stops speculation due to branch mispredictions.
+                            insert_fence_at_beginning_of_block(self.func, inst, self.fence_counts);
+                        }
+                        _ => panic!(
+                            "This function didn't expect to be called with blade_type {:?}",
+                            self.blade_type
+                        ),
                     }
-                    BladeType::LfencePerBlock => {
-                        // just put one fence at the beginning of the block.
-                        // this stops speculation due to branch mispredictions.
-                        insert_fence_at_beginning_of_block(func, inst, fence_counts);
-                    }
-                    _ => panic!(
-                        "This function didn't expect to be called with blade_type {:?}",
-                        blade_type
-                    ),
                 }
-            }
-            ValueDef::Param(block, _) => {
-                // cut at this value by putting lfence at beginning of
-                // the `block`, that is, before the first instruction
-                let first_inst = func
-                    .layout
-                    .first_inst(block)
-                    .expect("block has no instructions");
-                insert_fence_before_inst(func, first_inst, fence_counts);
-            }
-        },
-        BladeNode::Sink(_) => panic!("Fencing after a sink instruction"),
+                ValueDef::Param(block, _) => {
+                    // cut at this value by putting lfence at beginning of
+                    // the `block`, that is, before the first instruction
+                    let first_inst = self.func
+                        .layout
+                        .first_inst(block)
+                        .expect("block has no instructions");
+                    insert_fence_before_inst(self.func, first_inst, self.fence_counts);
+                }
+            },
+            BladeNode::Sink(_) => panic!("Fencing after a sink instruction"),
+        }
     }
 }
 
