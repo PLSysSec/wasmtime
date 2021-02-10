@@ -388,15 +388,7 @@ fn insert_fence_before(func: &mut Function, bnode: &BladeNode, blade_type: Blade
                 match blade_type {
                     BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                         // cut at this value by putting lfence before `inst`
-                        if func.pre_lfence[inst] {
-                            // do nothing, already had a fence here
-                        } else {
-                            if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
-                                println!("inserting fence before instruction {:?}", func.dfg[inst]);
-                            }
-                            func.pre_lfence[inst] = true;
-                            fence_counts.static_fences_inserted += 1;
-                        }
+                        insert_fence_before_inst(func, inst, fence_counts);
                     }
                     BladeType::LfencePerBlock => {
                         // just put one fence at the beginning of the block.
@@ -416,30 +408,14 @@ fn insert_fence_before(func: &mut Function, bnode: &BladeNode, blade_type: Blade
                     .layout
                     .first_inst(block)
                     .expect("block has no instructions");
-                if func.pre_lfence[first_inst] {
-                    // do nothing, already had a fence there
-                } else {
-                    if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
-                        println!("inserting fence before instruction {:?}", func.dfg[first_inst]);
-                    }
-                    func.pre_lfence[first_inst] = true;
-                    fence_counts.static_fences_inserted += 1;
-                }
+                insert_fence_before_inst(func, first_inst, fence_counts);
             }
         },
         BladeNode::Sink(inst) => {
             match blade_type {
                 BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                     // cut at this instruction by putting lfence before it
-                    if func.pre_lfence[*inst] {
-                        // do nothing, already had a fence here
-                    } else {
-                        if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
-                            println!("inserting fence before instruction {:?}", func.dfg[*inst]);
-                        }
-                        func.pre_lfence[*inst] = true;
-                        fence_counts.static_fences_inserted += 1;
-                    }
+                    insert_fence_before_inst(func, *inst, fence_counts);
                 }
                 BladeType::LfencePerBlock => {
                     // just put one fence at the beginning of the block.
@@ -462,15 +438,7 @@ fn insert_fence_after(func: &mut Function, bnode: &BladeNode, blade_type: BladeT
                 match blade_type {
                     BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                         // cut at this value by putting lfence after `inst`
-                        if func.post_lfence[inst] {
-                            // do nothing, already had a fence here
-                        } else {
-                            if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
-                                println!("inserting fence after instruction {:?}", func.dfg[inst]);
-                            }
-                            func.post_lfence[inst] = true;
-                            fence_counts.static_fences_inserted += 1;
-                        }
+                        insert_fence_after_inst(func, inst, fence_counts);
                     }
                     BladeType::LfencePerBlock => {
                         // just put one fence at the beginning of the block.
@@ -490,18 +458,36 @@ fn insert_fence_after(func: &mut Function, bnode: &BladeNode, blade_type: BladeT
                     .layout
                     .first_inst(block)
                     .expect("block has no instructions");
-                if func.pre_lfence[first_inst] {
-                    // do nothing, already had a fence here
-                } else {
-                    if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
-                        println!("inserting fence before instruction {:?}", func.dfg[first_inst]);
-                    }
-                    func.pre_lfence[first_inst] = true;
-                    fence_counts.static_fences_inserted += 1;
-                }
+                insert_fence_before_inst(func, first_inst, fence_counts);
             }
         },
         BladeNode::Sink(_) => panic!("Fencing after a sink instruction"),
+    }
+}
+
+/// Primitive that literally inserts a fence before an `Inst`.
+fn insert_fence_before_inst(func: &mut Function, inst: Inst, fence_counts: &mut FenceCounts) {
+    if func.pre_lfence[inst] {
+        // do nothing, already had a fence here
+    } else {
+        if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+            println!("inserting fence before instruction {:?}", func.dfg[inst]);
+        }
+        func.pre_lfence[inst] = true;
+        fence_counts.static_fences_inserted += 1;
+    }
+}
+
+/// Primitive that literally inserts a fence after an `Inst`.
+fn insert_fence_after_inst(func: &mut Function, inst: Inst, fence_counts: &mut FenceCounts) {
+    if func.post_lfence[inst] {
+        // do nothing, already had a fence here
+    } else {
+        if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+            println!("inserting fence after instruction {:?}", func.dfg[inst]);
+        }
+        func.post_lfence[inst] = true;
+        fence_counts.static_fences_inserted += 1;
     }
 }
 
@@ -525,15 +511,7 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, fence_cou
     loop {
         if cur_inst == first_inst {
             // got to beginning of EBB: insert at beginning of EBB
-            if func.pre_lfence[first_inst] {
-                // do nothing, already had a fence here
-            } else {
-                if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
-                    println!("inserting fence before instruction {:?}", func.dfg[first_inst]);
-                }
-                func.pre_lfence[first_inst] = true;
-                fence_counts.static_fences_inserted += 1;
-            }
+            insert_fence_before_inst(func, first_inst, fence_counts);
             break;
         }
         cur_inst = func
@@ -544,15 +522,7 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, fence_cou
         if opcode.is_call() || opcode.is_branch() || opcode.is_indirect_branch() {
             // found the previous call or branch instruction:
             // insert after that call or branch instruction
-            if func.post_lfence[cur_inst] {
-                // do nothing, already had a fence here
-            } else {
-                if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
-                    println!("inserting fence after instruction {:?}", func.dfg[cur_inst]);
-                }
-                func.post_lfence[cur_inst] = true;
-                fence_counts.static_fences_inserted += 1;
-            }
+            insert_fence_after_inst(func, cur_inst, fence_counts);
             break;
         }
     }
