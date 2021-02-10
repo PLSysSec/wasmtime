@@ -113,7 +113,8 @@ impl<'a> BladePass<'a> {
         let blade_v1_1 = self.isa.flags().blade_v1_1();
 
         if blade_type == BladeType::SwitchbladeFenceA {
-            // Insert fences to ensure that function arguments and return values aren't BC
+            // Preliminary pass to insert fences to ensure that function
+            // arguments and return values aren't BC
             let mut insts_needing_fences = vec![];
             let bcdata = self.get_bcdata();
             if DEBUG_PRINT_BC_NODES {
@@ -137,6 +138,7 @@ impl<'a> BladePass<'a> {
             }
         }
 
+        // build the Blade graph
         let store_values_are_sinks =
             if blade_type == BladeType::Slh && blade_v1_1 {
                 // For SLH to protect from v1.1, store values must be marked as sinks
