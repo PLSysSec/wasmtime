@@ -116,11 +116,19 @@ impl<'a> BladePass<'a> {
         }
     }
 
+    fn get_def_use_graph_no_call_edges(&self) -> Ref<DefUseGraph> {
+        self.def_use_graph_no_call_edges
+            .get_or_insert_with(|| DefUseGraph::for_function(self.func, self.cfg, false))
+    }
+
+    fn get_def_use_graph_with_call_edges(&self) -> Ref<DefUseGraph> {
+        self.def_use_graph_with_call_edges
+            .get_or_insert_with(|| DefUseGraph::for_function(self.func, self.cfg, true))
+    }
+
     fn get_bcdata(&self) -> Ref<BCData> {
-        let dug_no_call_edges =
-            self.def_use_graph_no_call_edges.get_or_insert_with(|| DefUseGraph::for_function(self.func, self.cfg, false));
-        let dug_with_call_edges =
-            self.def_use_graph_with_call_edges.get_or_insert_with(|| DefUseGraph::for_function(self.func, self.cfg, true));
+        let dug_no_call_edges = self.get_def_use_graph_no_call_edges();
+        let dug_with_call_edges = self.get_def_use_graph_with_call_edges();
         self.bcdata.get_or_insert_with(move || BCData::new(self.func, self.blade_type, &dug_no_call_edges, &dug_with_call_edges))
     }
 
@@ -261,8 +269,7 @@ impl<'a> BladePass<'a> {
             // (required to be stable) by fencing in the callee if necessary, so
             // the caller (us) may safely assume the return value is untainted
             // (stable).
-            let def_use_graph = self.def_use_graph_no_call_edges
-                .get_or_insert_with(|| DefUseGraph::for_function(self.func, self.cfg, false));
+            let def_use_graph = self.get_def_use_graph_no_call_edges();
             for val_use in def_use_graph.uses_of_val(val) {
                 match *val_use {
                     ValueUse::Inst(inst_use) => {
