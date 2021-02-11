@@ -37,6 +37,9 @@ const DEBUG_PRINT_DETAILED_DEF_LOCATIONS: bool = false;
 /// This only has an effect under Switchblade strategies.
 const DEBUG_PRINT_BC_NODES: bool = false;
 
+/// Print the list of all sources in the Blade graph.
+const DEBUG_PRINT_SOURCES: bool = false;
+
 /// Should we print the (static) count of fences/SLHs
 const PRINT_FENCE_COUNTS: bool = true;
 
@@ -58,7 +61,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
 
     if PRINT_FENCE_COUNTS {
         match blade_type {
-            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
                 println!("function {}: inserted {} (static) lfences", func.name, fence_counts.static_fences_inserted);
                 assert_eq!(fence_counts.static_slhs_inserted, 0);
             }
@@ -80,10 +83,20 @@ struct BladePass<'a> {
     func: &'a mut Function,
     /// The CFG for that function
     cfg: &'a ControlFlowGraph,
-    /// The def-use graph for that function (we compute this during `BladePass::new()`)
-    def_use_graph: DefUseGraph,
     /// The `TargetIsa`
     isa: &'a dyn TargetIsa,
+    /// The `BladeType` of the pass we're doing
+    blade_type: BladeType,
+    /// Whether we are also protecting from v1.1 (as opposed to just v1)
+    blade_v1_1: bool,
+    /// The def-use graph for that function, with no call edges (see
+    /// documentation on `DefUseGraph`). `SimpleCache` ensures that we compute
+    /// this a maximum of once, and only if it is needed
+    def_use_graph_no_call_edges: SimpleCache<DefUseGraph>,
+    /// The def-use graph for that funcntion, with call edges (see
+    /// documentation on `DefUseGraph`). `SimpleCache` ensures that we compute
+    /// this a maximum of once, and only if it is needed
+    def_use_graph_with_call_edges: SimpleCache<DefUseGraph>,
     /// The `BCData` for that function. `SimpleCache` ensures that we compute
     /// this a maximum of once, and only if it is needed
     bcdata: SimpleCache<BCData>,
@@ -91,30 +104,34 @@ struct BladePass<'a> {
 
 impl<'a> BladePass<'a> {
     pub fn new(func: &'a mut Function, cfg: &'a ControlFlowGraph, isa: &'a dyn TargetIsa) -> Self {
-        let def_use_graph = DefUseGraph::for_function(func, cfg);
         Self {
             func,
             cfg,
-            def_use_graph,
             isa,
+            blade_type: isa.flags().blade_type(),
+            blade_v1_1: isa.flags().blade_v1_1(),
+            def_use_graph_no_call_edges: SimpleCache::new(),
+            def_use_graph_with_call_edges: SimpleCache::new(),
             bcdata: SimpleCache::new(),
         }
     }
 
     fn get_bcdata(&self) -> Ref<BCData> {
-        self.bcdata.get_or_insert_with(|| BCData::new(self.func, &self.def_use_graph))
+        let dug_no_call_edges =
+            self.def_use_graph_no_call_edges.get_or_insert_with(|| DefUseGraph::for_function(self.func, self.cfg, false));
+        let dug_with_call_edges =
+            self.def_use_graph_with_call_edges.get_or_insert_with(|| DefUseGraph::for_function(self.func, self.cfg, true));
+        self.bcdata.get_or_insert_with(move || BCData::new(self.func, self.blade_type, &dug_no_call_edges, &dug_with_call_edges))
     }
 
     /// Run the Blade pass, inserting fences/SLHs as necessary, and return the
     /// `FenceCounts` indicating how many of them were inserted
     pub fn run(&mut self) -> FenceCounts {
         let mut fence_counts = FenceCounts::new();
-        let blade_type = self.isa.flags().blade_type();
-        let blade_v1_1 = self.isa.flags().blade_v1_1();
 
-        if blade_type == BladeType::SwitchbladeFenceA {
+        if self.blade_type == BladeType::SwitchbladeFenceA || self.blade_type == BladeType::SwitchbladeFenceB {
             // Preliminary pass to insert fences to ensure that function
-            // arguments and return values aren't BC
+            // arguments, and (for SwitchbladeFenceA) return values, aren't BC
             let mut insts_needing_fences = vec![];
             let bcdata = self.get_bcdata();
             if DEBUG_PRINT_BC_NODES {
@@ -123,8 +140,8 @@ impl<'a> BladePass<'a> {
             for block in self.func.layout.blocks() {
                 for inst in self.func.layout.block_insts(block) {
                     let opcode = self.func.dfg[inst].opcode();
-                    if opcode.is_call() || opcode.is_return() {
-                        // if any arguments to the call or return are BC, fence before the call or return
+                    if opcode.is_call() || (self.blade_type == BladeType::SwitchbladeFenceA && opcode.is_return()) {
+                        // if any arguments to the call or (for SwitchbladeFenceA) return are BC, fence before the call or return
                         if self.func.dfg.inst_args(inst).iter().any(|&arg| bcdata.tainted_values.contains(arg)) {
                             insts_needing_fences.push(inst);
                         }
@@ -132,7 +149,7 @@ impl<'a> BladePass<'a> {
                 }
             }
             std::mem::drop(bcdata);  // drops the borrow of self, so we can borrow it mutably to insert fences
-            let mut fence_inserter = FenceInserter::new(self.func, blade_type, &mut fence_counts);
+            let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut fence_counts);
             for inst in insts_needing_fences {
                 fence_inserter.insert_fence_before(&BladeNode::Sink(inst));
             }
@@ -140,24 +157,26 @@ impl<'a> BladePass<'a> {
 
         // build the Blade graph
         let store_values_are_sinks =
-            if blade_type == BladeType::Slh && blade_v1_1 {
+            if self.blade_type == BladeType::Slh && self.blade_v1_1 {
                 // For SLH to protect from v1.1, store values must be marked as sinks
                 true
             } else {
                 false
             };
-        let sources = match (blade_type, blade_v1_1) {
+        let sources = match (self.blade_type, self.blade_v1_1) {
             (BladeType::SwitchbladeFenceA, false) => Sources::BCAddr,
+            (BladeType::SwitchbladeFenceB, false) => Sources::BCAddr,
             (BladeType::SwitchbladeFenceA, true) => unimplemented!("switchblade_fence_a is not implemented for v1.1 yet"),
+            (BladeType::SwitchbladeFenceB, true) => unimplemented!("switchblade_fence_b is not implemented for v1.1 yet"),
             (_, false) => Sources::NonConstantAddr,
             (_, true) => Sources::AllLoads,
         };
         let blade_graph = self.build_blade_graph(store_values_are_sinks, sources);
 
         // insert the fences / SLHs
-        match blade_type {
+        match self.blade_type {
             BladeType::BaselineFence => {
-                let mut fence_inserter = FenceInserter::new(self.func, blade_type, &mut fence_counts);
+                let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut fence_counts);
                 for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
                     // insert a fence after every source
                     fence_inserter.insert_fence_after(&blade_graph.node_to_bladenode_map[&source]);
@@ -170,8 +189,8 @@ impl<'a> BladePass<'a> {
                     slh_inserter.apply_slh_to_bnode(&blade_graph.node_to_bladenode_map[&source]);
                 }
             }
-            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA => {
-                let mut fence_inserter = FenceInserter::new(self.func, blade_type, &mut fence_counts);
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
+                let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut fence_counts);
                 for cut_edge in blade_graph.min_cut() {
                     let edge_src = blade_graph.graph.src(cut_edge);
                     let edge_snk = blade_graph.graph.snk(cut_edge);
@@ -233,7 +252,18 @@ impl<'a> BladePass<'a> {
         // (in this example, z -> sink and source -> x)
         for val in self.func.dfg.values() {
             let node = builder.bladenode_to_node_map[&BladeNode::ValueDef(val)]; // must exist
-            for val_use in self.def_use_graph.uses_of_val(val) {
+            // This step uses the `def_use_graph_no_call_edges`, which means
+            // that even if a call argument is tainted (transient), the result
+            // of the call will not be tainted. (In fact, results of call
+            // instructions will never be tainted, because there will be no
+            // incoming edges.)
+            // This is ok because return values are prevented from being tainted
+            // (required to be stable) by fencing in the callee if necessary, so
+            // the caller (us) may safely assume the return value is untainted
+            // (stable).
+            let def_use_graph = self.def_use_graph_no_call_edges
+                .get_or_insert_with(|| DefUseGraph::for_function(self.func, self.cfg, false));
+            for val_use in def_use_graph.uses_of_val(val) {
                 match *val_use {
                     ValueUse::Inst(inst_use) => {
                         // add an edge from val to the result of inst_use
@@ -391,7 +421,7 @@ impl<'a> FenceInserter<'a> {
             BladeNode::ValueDef(val) => match self.func.dfg.value_def(*val) {
                 ValueDef::Result(inst, _) => {
                     match self.blade_type {
-                        BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
+                        BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
                             // cut at this value by putting lfence before `inst`
                             insert_fence_before_inst(self.func, inst, self.fence_counts);
                         }
@@ -418,7 +448,7 @@ impl<'a> FenceInserter<'a> {
             },
             BladeNode::Sink(inst) => {
                 match self.blade_type {
-                    BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
+                    BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
                         // cut at this instruction by putting lfence before it
                         insert_fence_before_inst(self.func, *inst, self.fence_counts);
                     }
@@ -441,7 +471,7 @@ impl<'a> FenceInserter<'a> {
             BladeNode::ValueDef(val) => match self.func.dfg.value_def(*val) {
                 ValueDef::Result(inst, _) => {
                     match self.blade_type {
-                        BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
+                        BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
                             // cut at this value by putting lfence after `inst`
                             insert_fence_after_inst(self.func, inst, self.fence_counts);
                         }
@@ -649,7 +679,15 @@ impl DefUseGraph {
     /// Create a `DefUseGraph` for the given `Function`.
     ///
     /// `cfg`: the `ControlFlowGraph` for the `Function`.
-    pub fn for_function(func: &Function, cfg: &ControlFlowGraph) -> Self {
+    ///
+    /// `call_edges`: if `true`, then for call instructions, the result of the
+    /// instruction (i.e., the return value) is considered to be a use of each of
+    /// the call arguments. if `false`, then that result (the return value) is
+    /// not considered to be a use of anything - it will have no dependents.
+    /// This is specifically for call instructions, and does not affect the
+    /// return value of this function itself, which will still of course be
+    /// considered as using whatever it uses within this function.
+    pub fn for_function(func: &Function, cfg: &ControlFlowGraph, call_edges: bool) -> Self {
         let mut map: SecondaryMap<Value, Vec<ValueUse>> =
             SecondaryMap::with_capacity(func.dfg.num_values());
         let mut inverse_map: SecondaryMap<Value, Vec<Value>> =
@@ -660,6 +698,11 @@ impl DefUseGraph {
             // each of its parameters.
             // And mark the parameters as dependents of the instruction result(s).
             for inst in func.layout.block_insts(block) {
+                // Depending on the `call_edges` option, don't mark the result
+                // of a call as a use of each of its parameters
+                if !call_edges && func.dfg[inst].opcode().is_call() {
+                    continue;
+                }
                 let results = func.dfg.inst_results(inst);
                 for arg in func.dfg.inst_args(inst) {
                     map[*arg].push(ValueUse::Inst(inst));
@@ -852,7 +895,12 @@ struct BCData {
 
 impl BCData {
     /// Determine which values in the given function are BC-tainted
-    fn new(func: &Function, def_use_graph: &DefUseGraph) -> Self {
+    fn new(
+        func: &Function,
+        blade_type: BladeType,
+        def_use_graph_no_call_edges: &DefUseGraph,
+        def_use_graph_with_call_edges: &DefUseGraph,
+    ) -> Self {
         // first we collect a list of all the values used as branch conditions
         let branch_conditions = {
             let mut branch_conditions = vec![];
@@ -889,9 +937,35 @@ impl BCData {
                         } else {
                             // mark the item as a root, which will also prevent us from processing this item again
                             roots.insert(val);
-                            // add all (non-constant) values which contribute to it to the worklist
-                            for v in def_use_graph.dependents_of_val(val).filter(|&v| !value_is_constant(func, *v)) {
+                            // add all (non-constant) values which contribute to it to the worklist.
+                            //
+                            // This step needs to use the `def_use_graph_with_call_edges`, because
+                            // of examples such as Kocher 13, in which `x` needs to be marked BC
+                            // during this step.
+                            let contributing_vals = def_use_graph_with_call_edges
+                                .dependents_of_val(val)
+                                .filter(|&v| !value_is_constant(func, *v));
+                            for v in contributing_vals {
                                 worklist.push(*v);
+                            }
+                        }
+                    }
+                }
+            }
+            if blade_type == BladeType::SwitchbladeFenceB {
+                // as a final step, for SwitchbladeFenceB, we mark all results
+                // of call instructions as BC. Since callees are not required to
+                // ensure that their return values are not BC, callers must
+                // (pessimistically) assume that the return value is BC.
+                // We don't need to backtrace from them (which is why we didn't
+                // add them to the worklist above), but we do need to forward-
+                // trace from them (which is why we add them to the roots, and
+                // not just taint them all at the end).
+                for block in func.layout.blocks() {
+                    for inst in func.layout.block_insts(block) {
+                        if func.dfg[inst].opcode().is_call() {
+                            for result in func.dfg.inst_results(inst) {
+                                roots.insert(*result);
                             }
                         }
                     }
@@ -914,8 +988,23 @@ impl BCData {
                     } else {
                         // mark the value as tainted, which will also prevent us from processing this value again
                         tainted_values.insert(val);
-                        // add all uses of the value to the worklist
-                        for v in def_use_graph.uses_of_val(val) {
+                        // add all uses of the value to the worklist.
+                        //
+                        // This step uses the `def_use_graph_no_call_edges`, which means that
+                        // even if a call argument is marked BC in this step (or is a root),
+                        // the result of that call will not be marked BC (unless it is also a
+                        // root, of course).
+                        // This is ok because:
+                        //   - if any call argument would be BC, Switchblade will fence before
+                        //     that call, and the BC-ness does not propagate beyond that fence
+                        //   - for SwitchbladeFenceA, return values likewise are prevented from
+                        //     being BC by fencing in the callee if necessary, so the caller may
+                        //     assume the return value is not BC
+                        //   - for SwitchbladeFenceB, all return values are (pessimistically)
+                        //     already assumed BC in the caller, so there's no reason to bother
+                        //     propagating the taint to them. (We already added them all to the
+                        //     roots, above.)
+                        for v in def_use_graph_no_call_edges.uses_of_val(val) {
                             match *v {
                                 ValueUse::Inst(inst_use) => {
                                     // add all the results of `inst` to the worklist
@@ -982,6 +1071,9 @@ impl BladeGraphBuilder {
     fn mark_as_source(&mut self, src: Value) {
         let node = self.bladenode_to_node_map[&BladeNode::ValueDef(src)];
         self.graph.add_edge(self.source_node, node);
+        if DEBUG_PRINT_SOURCES {
+            println!("marked as source: {:?}", src);
+        }
     }
 
     /// Add an edge from the given `Node` to the given `Value`
