@@ -398,6 +398,12 @@ impl Config {
         self.flags.set("blade_v1_1", val).expect("should be valid flag");
         self
     }
+
+    /// Sets the switchblade_callconv setting to be passed on to Cranelift
+    pub fn switchblade_callconv(&mut self, switchblade_callconv: impl AsRef<str>) -> Result<&mut Self> {
+        self.flags.set("switchblade_callconv", switchblade_callconv.as_ref())?;
+        Ok(self)
+    }
 }
 
 impl Default for Config {

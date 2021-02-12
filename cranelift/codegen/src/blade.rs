@@ -5,7 +5,7 @@ use crate::entity::{EntitySet, SecondaryMap};
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::{condcodes::IntCC, dfg::Bounds, ArgumentPurpose, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef};
 use crate::isa::TargetIsa;
-use crate::settings::BladeType;
+use crate::settings::{BladeType, SwitchbladeCallconv};
 use rs_graph::linkedlistgraph::{Edge, LinkedListGraph, Node};
 use rs_graph::maxflow::pushrelabel::PushRelabel;
 use rs_graph::maxflow::MaxFlow;
@@ -61,7 +61,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
 
     if PRINT_FENCE_COUNTS {
         match blade_type {
-            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                 println!("function {}: inserted {} (static) lfences", func.name, fence_counts.static_fences_inserted);
                 assert_eq!(fence_counts.static_slhs_inserted, 0);
             }
@@ -89,6 +89,8 @@ struct BladePass<'a> {
     blade_type: BladeType,
     /// Whether we are also protecting from v1.1 (as opposed to just v1)
     blade_v1_1: bool,
+    /// the Switchblade calling convention. (Not used if `blade_type` isn't Switchblade.)
+    switchblade_callconv: SwitchbladeCallconv,
     /// The def-use graph for that function, with no call edges (see
     /// documentation on `DefUseGraph`). `SimpleCache` ensures that we compute
     /// this a maximum of once, and only if it is needed
@@ -110,6 +112,7 @@ impl<'a> BladePass<'a> {
             isa,
             blade_type: isa.flags().blade_type(),
             blade_v1_1: isa.flags().blade_v1_1(),
+            switchblade_callconv: isa.flags().switchblade_callconv(),
             def_use_graph_no_call_edges: SimpleCache::new(),
             def_use_graph_with_call_edges: SimpleCache::new(),
             bcdata: SimpleCache::new(),
@@ -129,7 +132,13 @@ impl<'a> BladePass<'a> {
     fn get_bcdata(&self) -> Ref<BCData> {
         let dug_no_call_edges = self.get_def_use_graph_no_call_edges();
         let dug_with_call_edges = self.get_def_use_graph_with_call_edges();
-        self.bcdata.get_or_insert_with(move || BCData::new(self.func, self.blade_type, &dug_no_call_edges, &dug_with_call_edges))
+        self.bcdata.get_or_insert_with(move || BCData::new(
+            self.func,
+            self.blade_type,
+            self.switchblade_callconv,
+            &dug_no_call_edges,
+            &dug_with_call_edges
+        ))
     }
 
     /// Run the Blade pass, inserting fences/SLHs as necessary, and return the
@@ -137,9 +146,10 @@ impl<'a> BladePass<'a> {
     pub fn run(&mut self) -> FenceCounts {
         let mut fence_counts = FenceCounts::new();
 
-        if self.blade_type == BladeType::SwitchbladeFenceA || self.blade_type == BladeType::SwitchbladeFenceB {
+        if self.blade_type == BladeType::SwitchbladeFenceA {
             // Preliminary pass to insert fences to ensure that function
-            // arguments, and (for SwitchbladeFenceA) return values, aren't BC
+            // arguments and/or return values aren't BC (depending on the
+            // Switchblade calling convention)
             let mut insts_needing_fences = vec![];
             let bcdata = self.get_bcdata();
             if DEBUG_PRINT_BC_NODES {
@@ -148,10 +158,30 @@ impl<'a> BladePass<'a> {
             for block in self.func.layout.blocks() {
                 for inst in self.func.layout.block_insts(block) {
                     let opcode = self.func.dfg[inst].opcode();
-                    if opcode.is_call() || (self.blade_type == BladeType::SwitchbladeFenceA && opcode.is_return()) {
-                        // if any arguments to the call or (for SwitchbladeFenceA) return are BC, fence before the call or return
-                        if self.func.dfg.inst_args(inst).iter().any(|&arg| bcdata.tainted_values.contains(arg)) {
-                            insts_needing_fences.push(inst);
+                    if opcode.is_call() {
+                        // if the calling convention is that call arguments must
+                        // not be BC, fence before the call if any arguments
+                        // would be BC
+                        match self.switchblade_callconv {
+                            SwitchbladeCallconv::NotNot | SwitchbladeCallconv::NotMay => {
+                                if self.func.dfg.inst_args(inst).iter().any(|&arg| bcdata.tainted_values.contains(arg)) {
+                                    insts_needing_fences.push(inst);
+                                }
+                            }
+                            SwitchbladeCallconv::MayNot | SwitchbladeCallconv::MayMay => (),
+                        }
+                    }
+                    if opcode.is_return() {
+                        // if the calling convention is that return values must
+                        // not be BC, fence before the return if any returned
+                        // values would be BC
+                        match self.switchblade_callconv {
+                            SwitchbladeCallconv::NotNot | SwitchbladeCallconv::MayNot => {
+                                if self.func.dfg.inst_args(inst).iter().any(|&arg| bcdata.tainted_values.contains(arg)) {
+                                    insts_needing_fences.push(inst);
+                                }
+                            }
+                            SwitchbladeCallconv::NotMay | SwitchbladeCallconv::MayMay => (),
                         }
                     }
                 }
@@ -173,9 +203,7 @@ impl<'a> BladePass<'a> {
             };
         let sources = match (self.blade_type, self.blade_v1_1) {
             (BladeType::SwitchbladeFenceA, false) => Sources::BCAddr,
-            (BladeType::SwitchbladeFenceB, false) => Sources::BCAddr,
             (BladeType::SwitchbladeFenceA, true) => unimplemented!("switchblade_fence_a is not implemented for v1.1 yet"),
-            (BladeType::SwitchbladeFenceB, true) => unimplemented!("switchblade_fence_b is not implemented for v1.1 yet"),
             (_, false) => Sources::NonConstantAddr,
             (_, true) => Sources::AllLoads,
         };
@@ -197,7 +225,7 @@ impl<'a> BladePass<'a> {
                     slh_inserter.apply_slh_to_bnode(&blade_graph.node_to_bladenode_map[&source]);
                 }
             }
-            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA => {
                 let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut fence_counts);
                 for cut_edge in blade_graph.min_cut() {
                     let edge_src = blade_graph.graph.src(cut_edge);
@@ -381,8 +409,11 @@ impl<'a> BladePass<'a> {
             .layout
             .entry_block()
             .expect("Failed to find entry block");
-        for &func_param in self.func.dfg.block_params(entry_block) {
+        for &func_param in self.func.dfg.block_params(entry_block).iter().skip(1) {
             // parameters of the entry block == parameters of the function
+            // the skip(1) is because the first param is what Cranelift uses to
+            // supply the linear memory base address, it's not actually a Wasm
+            // function parameter
             builder.mark_as_source(func_param);
         }
         */
@@ -428,7 +459,7 @@ impl<'a> FenceInserter<'a> {
             BladeNode::ValueDef(val) => match self.func.dfg.value_def(*val) {
                 ValueDef::Result(inst, _) => {
                     match self.blade_type {
-                        BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
+                        BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                             // cut at this value by putting lfence before `inst`
                             insert_fence_before_inst(self.func, inst, self.fence_counts);
                         }
@@ -455,7 +486,7 @@ impl<'a> FenceInserter<'a> {
             },
             BladeNode::Sink(inst) => {
                 match self.blade_type {
-                    BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
+                    BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                         // cut at this instruction by putting lfence before it
                         insert_fence_before_inst(self.func, *inst, self.fence_counts);
                     }
@@ -478,7 +509,7 @@ impl<'a> FenceInserter<'a> {
             BladeNode::ValueDef(val) => match self.func.dfg.value_def(*val) {
                 ValueDef::Result(inst, _) => {
                     match self.blade_type {
-                        BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
+                        BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                             // cut at this value by putting lfence after `inst`
                             insert_fence_after_inst(self.func, inst, self.fence_counts);
                         }
@@ -905,6 +936,7 @@ impl BCData {
     fn new(
         func: &Function,
         blade_type: BladeType,
+        switchblade_callconv: SwitchbladeCallconv,
         def_use_graph_no_call_edges: &DefUseGraph,
         def_use_graph_with_call_edges: &DefUseGraph,
     ) -> Self {
@@ -959,23 +991,61 @@ impl BCData {
                     }
                 }
             }
-            if blade_type == BladeType::SwitchbladeFenceB {
-                // as a final step, for SwitchbladeFenceB, we mark all results
-                // of call instructions as BC. Since callees are not required to
-                // ensure that their return values are not BC, callers must
-                // (pessimistically) assume that the return value is BC.
-                // We don't need to backtrace from them (which is why we didn't
-                // add them to the worklist above), but we do need to forward-
-                // trace from them (which is why we add them to the roots, and
-                // not just taint them all at the end).
-                for block in func.layout.blocks() {
-                    for inst in func.layout.block_insts(block) {
-                        if func.dfg[inst].opcode().is_call() {
-                            for result in func.dfg.inst_results(inst) {
-                                roots.insert(*result);
+            if blade_type == BladeType::SwitchbladeFenceA {
+                // If needed, based on the calling convention, we mark function
+                // parameters and/or results of call instructions as BC roots.
+                match switchblade_callconv {
+                    SwitchbladeCallconv::NotMay | SwitchbladeCallconv::MayMay => {
+                        // Since these calling conventions allow return values
+                        // to be BC, callees are not required to ensure that
+                        // their return values are not BC, and thus callers
+                        // (that's us) must pessimistically assume that return
+                        // values are BC.
+                        // We mark all results of call instructions as BC roots.
+                        // We don't need to backtrace from them (which is why we
+                        // didn't add them to the worklist above), but we do
+                        // need to forward- trace from them (which is why we add
+                        // them to the roots, and not just taint them all at the
+                        // end).
+                        for block in func.layout.blocks() {
+                            for inst in func.layout.block_insts(block) {
+                                if func.dfg[inst].opcode().is_call() {
+                                    for result in func.dfg.inst_results(inst) {
+                                        roots.insert(*result);
+                                    }
+                                }
                             }
                         }
                     }
+                    SwitchbladeCallconv::NotNot | SwitchbladeCallconv::MayNot => (),
+                }
+                match switchblade_callconv {
+                    SwitchbladeCallconv::MayNot | SwitchbladeCallconv::MayMay => {
+                        // Since these calling conventions allow call arguments
+                        // to be BC, callers are not required to ensure that
+                        // the arguments they're passing are not BC, and thus
+                        // callees (that's us) must pessimistically assume that
+                        // function parameters are BC.
+                        // We mark all function parameters as BC roots.
+                        // We don't need to backtrace from them (which is why we
+                        // didn't add them to the worklist above), but we do
+                        // need to forward- trace from them (which is why we add
+                        // them to the roots, and not just taint them all at the
+                        // end).
+                        let entry_block = func
+                            .layout
+                            .entry_block()
+                            .expect("Failed to find entry block");
+                        for func_param in func.dfg.block_params(entry_block).iter().skip(1) {
+                            // parameters of the entry block == parameters of the function
+                            // the skip(1) is because the first param is what
+                            // Cranelift uses to supply the linear memory base
+                            // address, it's not actually a Wasm function
+                            // parameter
+                            roots.insert(*func_param);
+                        }
+                    }
+                    SwitchbladeCallconv::NotNot | SwitchbladeCallconv::NotMay => (),
                 }
             }
             roots
@@ -1002,15 +1072,12 @@ impl BCData {
                         // the result of that call will not be marked BC (unless it is also a
                         // root, of course).
                         // This is ok because:
-                        //   - if any call argument would be BC, Switchblade will fence before
-                        //     that call, and the BC-ness does not propagate beyond that fence
-                        //   - for SwitchbladeFenceA, return values likewise are prevented from
-                        //     being BC by fencing in the callee if necessary, so the caller may
-                        //     assume the return value is not BC
-                        //   - for SwitchbladeFenceB, all return values are (pessimistically)
-                        //     already assumed BC in the caller, so there's no reason to bother
-                        //     propagating the taint to them. (We already added them all to the
-                        //     roots, above.)
+                        //   - for calling conventions where return values must not be BC: the
+                        //     callee is responsible for fencing if necessary, so it's ok for
+                        //     the caller (us) to assume that they are not BC
+                        //   - for calling conventions where return values may be BC: we
+                        //     already (pessimistically) marked all return values as BC roots
+                        //     above, so there's no need to propagate the taint to them now.
                         for v in def_use_graph_no_call_edges.uses_of_val(val) {
                             match *v {
                                 ValueUse::Inst(inst_use) => {

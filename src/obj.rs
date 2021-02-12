@@ -25,6 +25,7 @@ pub fn compile_to_obj(
     cache_config: &CacheConfig,
     blade_type: impl AsRef<str>,
     blade_v1_1: bool,
+    switchblade_callconv: impl AsRef<str>,
 ) -> Result<Artifact> {
     let isa_builder = match target {
         Some(target) => native::lookup(target.clone())?,
@@ -55,6 +56,7 @@ pub fn compile_to_obj(
     if blade_v1_1 {
         flag_builder.enable("blade_v1_1").unwrap();
     }
+    flag_builder.set("switchblade_callconv", switchblade_callconv.as_ref()).unwrap();
 
     let isa = isa_builder.finish(settings::Flags::new(flag_builder));
 

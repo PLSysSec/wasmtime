@@ -275,7 +275,6 @@ pub(crate) fn define() -> SettingGroup {
             lfence_per_block: insert lfences at top of block containing the cut point, max one lfence per block
             slh: use SLH on the loads leading to cut points (can't SLH on the cut points themselves)
             switchblade_fence_a: like lfence, but only loads with BC addresses are sources
-            switchblade_fence_b: a variant of switchblade_fence_a with different calling conventions around BC
         "#,
         vec![
             "none",
@@ -285,7 +284,6 @@ pub(crate) fn define() -> SettingGroup {
             "lfence_per_block",
             "slh",
             "switchblade_fence_a",
-            "switchblade_fence_b",
         ],
     );
 
@@ -296,6 +294,24 @@ pub(crate) fn define() -> SettingGroup {
             only Spectre v1 protections are enabled.
         "#,
         false,
+    );
+
+    settings.add_enum(
+        "switchblade_callconv",
+        r#"
+            Which calling convention to use for Switchblade. (No effect if blade_type isn't Switchblade.)"
+
+            not_not: call args must not be BC, retvals must not be BC
+            not_may: call args must not be BC, retvals may be BC
+            may_not: call args may be BC, retvals must not be BC
+            may_may: call args may be BC, retvals may be BC
+        "#,
+        vec![
+            "not_not",
+            "not_may",
+            "may_not",
+            "may_may",
+        ],
     );
 
     settings.build()

@@ -149,6 +149,8 @@ struct CommonOptions {
     blade_type: String,
     #[structopt(long)]
     blade_v1_1: bool,
+    #[structopt(long, default_value="not_not")]
+    switchblade_callconv: String,
 
     /// Optimization level for generated functions (0 (none), 1, 2 (most), or s
     /// (size))
@@ -175,7 +177,8 @@ impl CommonOptions {
             .strategy(pick_compilation_strategy(self.cranelift, self.lightbeam)?)?
             .profiler(pick_profiling_strategy(self.jitdump, self.vtune)?)?
             .blade_type(&self.blade_type)?
-            .blade_v1_1(self.blade_v1_1);
+            .blade_v1_1(self.blade_v1_1)
+            .switchblade_callconv(&self.switchblade_callconv)?;
         if !self.disable_cache {
             match &self.config {
                 Some(path) => {

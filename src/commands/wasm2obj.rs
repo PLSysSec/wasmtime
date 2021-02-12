@@ -79,6 +79,7 @@ impl WasmToObjCommand {
             &cache_config,
             &self.common.blade_type,
             self.common.blade_v1_1,
+            &self.common.switchblade_callconv,
         )?;
 
         // FIXME: Make the format a parameter.
