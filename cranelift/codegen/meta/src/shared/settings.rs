@@ -276,6 +276,7 @@ pub(crate) fn define() -> SettingGroup {
             slh: use SLH on the loads leading to cut points (can't SLH on the cut points themselves)
             switchblade_fence_a: like lfence, but only loads with BC addresses are sources
             switchblade_fence_b: like switchblade_fence_a, but with lfence_per_block
+            switchblade_fence_c: like switchblade_fence_b, but with better reasoning in some cases
         "#,
         vec![
             "none",
@@ -286,6 +287,7 @@ pub(crate) fn define() -> SettingGroup {
             "slh",
             "switchblade_fence_a",
             "switchblade_fence_b",
+            "switchblade_fence_c",
         ],
     );
 

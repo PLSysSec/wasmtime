@@ -61,7 +61,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
 
     if PRINT_FENCE_COUNTS {
         match blade_type {
-            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                 println!("function {}: inserted {} (static) lfences", func.name, fence_counts.static_fences_inserted);
                 assert_eq!(fence_counts.static_slhs_inserted, 0);
             }
@@ -124,6 +124,7 @@ impl<'a> BladePass<'a> {
         match self.blade_type {
             BladeType::SwitchbladeFenceA => true,
             BladeType::SwitchbladeFenceB => true,
+            BladeType::SwitchbladeFenceC => true,
             _ => false,
         }
     }
@@ -215,6 +216,8 @@ impl<'a> BladePass<'a> {
             (BladeType::SwitchbladeFenceA, true) => unimplemented!("switchblade_fence_a is not implemented for v1.1 yet"),
             (BladeType::SwitchbladeFenceB, false) => Sources::BCAddr,
             (BladeType::SwitchbladeFenceB, true) => unimplemented!("switchblade_fence_b is not implemented for v1.1 yet"),
+            (BladeType::SwitchbladeFenceC, false) => Sources::BCAddr,
+            (BladeType::SwitchbladeFenceC, true) => unimplemented!("switchblade_fence_c is not implemented for v1.1 yet"),
             (_, false) => Sources::NonConstantAddr,
             (_, true) => Sources::AllLoads,
         };
@@ -236,7 +239,7 @@ impl<'a> BladePass<'a> {
                     slh_inserter.apply_slh_to_bnode(&blade_graph.node_to_bladenode_map[&source]);
                 }
             }
-            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                 let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut fence_counts);
                 for cut_edge in blade_graph.min_cut() {
                     let edge_src = blade_graph.graph.src(cut_edge);
@@ -330,6 +333,12 @@ impl<'a> BladePass<'a> {
         // now we find sources and sinks, and add edges to/from our global source and sink nodes
         for block in self.func.layout.blocks() {
             for inst in self.func.layout.block_insts(block) {
+                if self.blade_type == BladeType::SwitchbladeFenceC && is_there_a_fence_at_top_of_this_linear_block(self.func, inst) {
+                    // SwitchbladeFenceC doesn't mark anything as a source or a
+                    // sink if there is a fence at the top of its linear block
+                    continue;
+                }
+
                 let idata = &self.func.dfg[inst];
                 let op = idata.opcode();
                 if op.can_load() {
@@ -474,7 +483,7 @@ impl<'a> FenceInserter<'a> {
                             // cut at this value by putting lfence before `inst`
                             insert_fence_before_inst(self.func, inst, self.fence_counts);
                         }
-                        BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB => {
+                        BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                             // just put one fence at the beginning of the block.
                             // this stops speculation due to branch mispredictions.
                             insert_fence_at_beginning_of_block(self.func, inst, self.fence_counts);
@@ -501,7 +510,7 @@ impl<'a> FenceInserter<'a> {
                         // cut at this instruction by putting lfence before it
                         insert_fence_before_inst(self.func, *inst, self.fence_counts);
                     }
-                    BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB => {
+                    BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                         // just put one fence at the beginning of the block.
                         // this stops speculation due to branch mispredictions.
                         insert_fence_at_beginning_of_block(self.func, *inst, self.fence_counts);
@@ -524,7 +533,7 @@ impl<'a> FenceInserter<'a> {
                             // cut at this value by putting lfence after `inst`
                             insert_fence_after_inst(self.func, inst, self.fence_counts);
                         }
-                        BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB => {
+                        BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                             // just put one fence at the beginning of the block.
                             // this stops speculation due to branch mispredictions.
                             insert_fence_at_beginning_of_block(self.func, inst, self.fence_counts);
@@ -576,14 +585,14 @@ fn insert_fence_after_inst(func: &mut Function, inst: Inst, fence_counts: &mut F
     }
 }
 
-// Inserts a fence at the beginning of the _basic block_ containing the given
-// instruction. "Basic block" is not to be confused with the _EBB_ or "extended
-// basic block" (which is what Cranelift considers a "block").
-// For our purposes in this function, all branch, call, and ret instructions
-// terminate blocks. In contrast, in Cranelift, only unconditional branch and
-// ret instructions terminate EBBs, while conditional branches and call
-// instructions do not terminate EBBs.
-fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, fence_counts: &mut FenceCounts) {
+/// Get the first instruction of the linear block containing the given `Inst`.
+/// Linear blocks are not to be confused with basic blocks, nor with the _EBB_ or
+/// "extended basic block" (which is what Cranelift considers a "block").
+/// For our purposes in this function, all branch, call, and ret instructions
+/// terminate blocks. In contrast, in Cranelift, only unconditional branch and
+/// ret instructions terminate EBBs, while conditional branches and call
+/// instructions do not terminate EBBs.
+fn get_first_inst_of_linear_block(func: &Function, inst: Inst) -> Inst {
     let ebb = func
         .layout
         .inst_block(inst)
@@ -595,22 +604,38 @@ fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, fence_cou
     let mut cur_inst = inst;
     loop {
         if cur_inst == first_inst {
-            // got to beginning of EBB: insert at beginning of EBB
-            insert_fence_before_inst(func, first_inst, fence_counts);
-            break;
+            // got to beginning of EBB: this is also the top of the linear block
+            return first_inst;
         }
-        cur_inst = func
+        // prev_inst will be the inst above cur_inst
+        let prev_inst = func
             .layout
             .prev_inst(cur_inst)
             .expect("Ran off the beginning of the EBB");
-        let opcode = func.dfg[cur_inst].opcode();
+        let opcode = func.dfg[prev_inst].opcode();
         if opcode.is_call() || opcode.is_branch() || opcode.is_indirect_branch() {
             // found the previous call or branch instruction:
-            // insert after that call or branch instruction
-            insert_fence_after_inst(func, cur_inst, fence_counts);
-            break;
+            // cur_inst is the top of the linear block
+            return cur_inst;
         }
+        cur_inst = prev_inst;
     }
+}
+
+/// Inserts a fence at the beginning of the _linear block_ containing the given
+/// instruction. See notes on `get_first_inst_of_linear_block()`, describing how
+/// we define linear blocks.
+fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, fence_counts: &mut FenceCounts) {
+    let top_linear_block = get_first_inst_of_linear_block(func, inst);
+    insert_fence_before_inst(func, top_linear_block, fence_counts);
+}
+
+/// Is there a fence at the beginning of the linear block containing the given
+/// instruction? See notes on `get_first_inst_of_linear_block()`, describing how
+/// we define linear blocks.
+fn is_there_a_fence_at_top_of_this_linear_block(func: &Function, inst: Inst) -> bool {
+    let top_linear_block = get_first_inst_of_linear_block(func, inst);
+    func.pre_lfence[top_linear_block]
 }
 
 struct SLHInserter<'a> {
@@ -1002,7 +1027,7 @@ impl BCData {
                     }
                 }
             }
-            if blade_type == BladeType::SwitchbladeFenceA || blade_type == BladeType::SwitchbladeFenceB {
+            if blade_type == BladeType::SwitchbladeFenceA || blade_type == BladeType::SwitchbladeFenceB || blade_type == BladeType::SwitchbladeFenceC {
                 // If needed, based on the calling convention, we mark function
                 // parameters and/or results of call instructions as BC roots.
                 match switchblade_callconv {
