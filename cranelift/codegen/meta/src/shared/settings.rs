@@ -275,6 +275,7 @@ pub(crate) fn define() -> SettingGroup {
             lfence_per_block: insert lfences at top of block containing the cut point, max one lfence per block
             slh: use SLH on the loads leading to cut points (can't SLH on the cut points themselves)
             switchblade_fence_a: like lfence, but only loads with BC addresses are sources
+            switchblade_fence_b: like switchblade_fence_a, but with lfence_per_block
         "#,
         vec![
             "none",
@@ -284,6 +285,7 @@ pub(crate) fn define() -> SettingGroup {
             "lfence_per_block",
             "slh",
             "switchblade_fence_a",
+            "switchblade_fence_b",
         ],
     );
 

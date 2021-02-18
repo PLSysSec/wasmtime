@@ -61,7 +61,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
 
     if PRINT_FENCE_COUNTS {
         match blade_type {
-            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
                 println!("function {}: inserted {} (static) lfences", func.name, fence_counts.static_fences_inserted);
                 assert_eq!(fence_counts.static_slhs_inserted, 0);
             }
@@ -119,6 +119,15 @@ impl<'a> BladePass<'a> {
         }
     }
 
+    /// Returns `true` if the blade type is one of the Switchblade types
+    fn is_switchblade(&self) -> bool {
+        match self.blade_type {
+            BladeType::SwitchbladeFenceA => true,
+            BladeType::SwitchbladeFenceB => true,
+            _ => false,
+        }
+    }
+
     fn get_def_use_graph_no_call_edges(&self) -> Ref<DefUseGraph> {
         self.def_use_graph_no_call_edges
             .get_or_insert_with(|| DefUseGraph::for_function(self.func, self.cfg, false))
@@ -146,7 +155,7 @@ impl<'a> BladePass<'a> {
     pub fn run(&mut self) -> FenceCounts {
         let mut fence_counts = FenceCounts::new();
 
-        if self.blade_type == BladeType::SwitchbladeFenceA {
+        if self.is_switchblade() {
             // Preliminary pass to insert fences to ensure that function
             // arguments and/or return values aren't BC (depending on the
             // Switchblade calling convention)
@@ -204,6 +213,8 @@ impl<'a> BladePass<'a> {
         let sources = match (self.blade_type, self.blade_v1_1) {
             (BladeType::SwitchbladeFenceA, false) => Sources::BCAddr,
             (BladeType::SwitchbladeFenceA, true) => unimplemented!("switchblade_fence_a is not implemented for v1.1 yet"),
+            (BladeType::SwitchbladeFenceB, false) => Sources::BCAddr,
+            (BladeType::SwitchbladeFenceB, true) => unimplemented!("switchblade_fence_b is not implemented for v1.1 yet"),
             (_, false) => Sources::NonConstantAddr,
             (_, true) => Sources::AllLoads,
         };
@@ -225,7 +236,7 @@ impl<'a> BladePass<'a> {
                     slh_inserter.apply_slh_to_bnode(&blade_graph.node_to_bladenode_map[&source]);
                 }
             }
-            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA => {
+            BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB => {
                 let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut fence_counts);
                 for cut_edge in blade_graph.min_cut() {
                     let edge_src = blade_graph.graph.src(cut_edge);
@@ -463,7 +474,7 @@ impl<'a> FenceInserter<'a> {
                             // cut at this value by putting lfence before `inst`
                             insert_fence_before_inst(self.func, inst, self.fence_counts);
                         }
-                        BladeType::LfencePerBlock => {
+                        BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB => {
                             // just put one fence at the beginning of the block.
                             // this stops speculation due to branch mispredictions.
                             insert_fence_at_beginning_of_block(self.func, inst, self.fence_counts);
@@ -490,7 +501,7 @@ impl<'a> FenceInserter<'a> {
                         // cut at this instruction by putting lfence before it
                         insert_fence_before_inst(self.func, *inst, self.fence_counts);
                     }
-                    BladeType::LfencePerBlock => {
+                    BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB => {
                         // just put one fence at the beginning of the block.
                         // this stops speculation due to branch mispredictions.
                         insert_fence_at_beginning_of_block(self.func, *inst, self.fence_counts);
@@ -513,7 +524,7 @@ impl<'a> FenceInserter<'a> {
                             // cut at this value by putting lfence after `inst`
                             insert_fence_after_inst(self.func, inst, self.fence_counts);
                         }
-                        BladeType::LfencePerBlock => {
+                        BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB => {
                             // just put one fence at the beginning of the block.
                             // this stops speculation due to branch mispredictions.
                             insert_fence_at_beginning_of_block(self.func, inst, self.fence_counts);
@@ -991,7 +1002,7 @@ impl BCData {
                     }
                 }
             }
-            if blade_type == BladeType::SwitchbladeFenceA {
+            if blade_type == BladeType::SwitchbladeFenceA || blade_type == BladeType::SwitchbladeFenceB {
                 // If needed, based on the calling convention, we mark function
                 // parameters and/or results of call instructions as BC roots.
                 match switchblade_callconv {
