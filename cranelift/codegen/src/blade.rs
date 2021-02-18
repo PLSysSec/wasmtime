@@ -1267,11 +1267,15 @@ fn value_is_constant(func: &Function, value: Value) -> bool {
                 | Opcode::Imul
                 | Opcode::ImulImm
                 | Opcode::Umulhi
+                | Opcode::X86Umulx
                 | Opcode::Smulhi
+                | Opcode::X86Smulx
                 | Opcode::Udiv
                 | Opcode::UdivImm
+                | Opcode::X86Udivmodx
                 | Opcode::Sdiv
                 | Opcode::SdivImm
+                | Opcode::X86Sdivmodx
                 | Opcode::Urem
                 | Opcode::UremImm
                 | Opcode::Srem
@@ -1334,11 +1338,19 @@ fn value_is_constant(func: &Function, value: Value) -> bool {
                 | Opcode::Fabs
                 | Opcode::Fcopysign
                 | Opcode::Fmin
+                | Opcode::X86Fmin
                 | Opcode::Fmax
+                | Opcode::X86Fmax
                 | Opcode::Ceil
                 | Opcode::Floor
                 | Opcode::Trunc
                 | Opcode::Nearest
+                | Opcode::FcvtToUint
+                | Opcode::FcvtToUintSat
+                | Opcode::FcvtToSint
+                | Opcode::FcvtToSintSat
+                | Opcode::FcvtFromUint
+                | Opcode::FcvtFromSint
                 // vector ops
                 | Opcode::Insertlane
                 | Opcode::Extractlane
@@ -1349,6 +1361,26 @@ fn value_is_constant(func: &Function, value: Value) -> bool {
                 | Opcode::Vselect
                 | Opcode::VanyTrue
                 | Opcode::VallTrue
+                | Opcode::X86Pshufb
+                | Opcode::X86Pshufd
+                | Opcode::X86Pextr
+                | Opcode::X86Pinsr
+                | Opcode::X86Insertps
+                | Opcode::X86Movsd
+                | Opcode::X86Movlhps
+                | Opcode::X86Psll
+                | Opcode::X86Psrl
+                | Opcode::X86Psra
+                | Opcode::X86Ptest
+                | Opcode::X86Pmaxs
+                | Opcode::X86Pmaxu
+                | Opcode::X86Pmins
+                | Opcode::X86Pminu
+                // Popcnt etc
+                | Opcode::Clz
+                | Opcode::Cls
+                | Opcode::Ctz
+                | Opcode::Popcnt
                 // other ops
                 | Opcode::IsNull
                 | Opcode::IsInvalid
@@ -1363,6 +1395,9 @@ fn value_is_constant(func: &Function, value: Value) -> bool {
                 | Opcode::Sextend
                 | Opcode::Fpromote
                 | Opcode::Fdemote
+                | Opcode::X86Cvtt2si
+                | Opcode::X86Bsf
+                | Opcode::X86Bsr
                 // copies
                 | Opcode::Copy
                 | Opcode::CopySpecial
@@ -1372,6 +1407,7 @@ fn value_is_constant(func: &Function, value: Value) -> bool {
                 | Opcode::Bitcast
                 | Opcode::RawBitcast
                 | Opcode::ScalarToVector
+                | Opcode::Spill  // behaves like a copy, see docs on it
                 | Opcode::Nop
                 => all_args_are_constant(func, inst),
                 Opcode::Load
@@ -1398,12 +1434,16 @@ fn value_is_constant(func: &Function, value: Value) -> bool {
                 | Opcode::Fill
                 | Opcode::FillNop
                 | Opcode::Regfill
+                | Opcode::X86Pop
                 | Opcode::GetPinnedReg
                 | Opcode::SetPinnedReg
                 | Opcode::IfcmpSp
                 | Opcode::Call
                 | Opcode::CallIndirect
                 | Opcode::JumpTableEntry
+                | Opcode::GlobalValue  // ?? conservative for now
+                | Opcode::SymbolValue  // ?? conservative for now
+                | Opcode::TlsValue  // ?? conservative for now
                 => false,
                 Opcode::Jump
                 | Opcode::Fallthrough
@@ -1423,7 +1463,7 @@ fn value_is_constant(func: &Function, value: Value) -> bool {
                 | Opcode::Istore32
                 | Opcode::Istore32Complex
                 | Opcode::StackStore
-                | Opcode::Spill
+                | Opcode::X86Push
                 | Opcode::Regspill
                 | Opcode::AdjustSpDown
                 | Opcode::AdjustSpUpImm
