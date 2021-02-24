@@ -40,8 +40,8 @@ const DEBUG_PRINT_BC_NODES: bool = false;
 /// Print the list of all sources in the Blade graph.
 const DEBUG_PRINT_SOURCES: bool = false;
 
-/// Should we print the (static) count of fences/SLHs
-const PRINT_FENCE_COUNTS: bool = true;
+/// Should we print various statistics about Blade's actions
+const PRINT_BLADE_STATS: bool = true;
 
 pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph) {
     let blade_type = isa.flags().blade_type();
@@ -53,25 +53,25 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         println!("Function before blade:\n{}", func.display(isa));
     }
 
-    let fence_counts = BladePass::new(func, cfg, isa).run();
+    let stats = BladePass::new(func, cfg, isa).run();
 
     if DEBUG_PRINT_FUNCTION_AFTER {
         println!("Function after blade:\n{}", func.display(isa));
     }
 
-    if PRINT_FENCE_COUNTS {
+    if PRINT_BLADE_STATS {
         match blade_type {
             BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
-                println!("function {}: inserted {} (static) lfences", func.name, fence_counts.static_fences_inserted);
-                assert_eq!(fence_counts.static_slhs_inserted, 0);
+                println!("function {}: inserted {} (static) lfences", func.name, stats.static_fences_inserted);
+                assert_eq!(stats.static_slhs_inserted, 0);
             }
             BladeType::Slh | BladeType::BaselineSlh => {
-                println!("function {}: inserted {} (static) SLHs", func.name, fence_counts.static_slhs_inserted);
-                assert_eq!(fence_counts.static_fences_inserted, 0);
+                println!("function {}: inserted {} (static) SLHs", func.name, stats.static_slhs_inserted);
+                assert_eq!(stats.static_fences_inserted, 0);
             }
             BladeType::None => {
-                assert_eq!(fence_counts.static_fences_inserted, 0);
-                assert_eq!(fence_counts.static_slhs_inserted, 0);
+                assert_eq!(stats.static_fences_inserted, 0);
+                assert_eq!(stats.static_slhs_inserted, 0);
             }
         }
     }
@@ -152,9 +152,9 @@ impl<'a> BladePass<'a> {
     }
 
     /// Run the Blade pass, inserting fences/SLHs as necessary, and return the
-    /// `FenceCounts` indicating how many of them were inserted
-    pub fn run(&mut self) -> FenceCounts {
-        let mut fence_counts = FenceCounts::new();
+    /// `BladeStats` with statistics about Blade's actions
+    pub fn run(&mut self) -> BladeStats {
+        let mut stats = BladeStats::new();
 
         if self.is_switchblade() {
             // Preliminary pass to insert fences to ensure that function
@@ -197,7 +197,7 @@ impl<'a> BladePass<'a> {
                 }
             }
             std::mem::drop(bcdata);  // drops the borrow of self, so we can borrow it mutably to insert fences
-            let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut fence_counts);
+            let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut stats);
             for inst in insts_needing_fences {
                 fence_inserter.insert_fence_before(&BladeNode::Sink(inst));
             }
@@ -226,21 +226,21 @@ impl<'a> BladePass<'a> {
         // insert the fences / SLHs
         match self.blade_type {
             BladeType::BaselineFence => {
-                let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut fence_counts);
+                let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut stats);
                 for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
                     // insert a fence after every source
                     fence_inserter.insert_fence_after(&blade_graph.node_to_bladenode_map[&source]);
                 }
             }
             BladeType::BaselineSlh => {
-                let mut slh_inserter = SLHInserter::new(self.func, self.isa, &mut fence_counts);
+                let mut slh_inserter = SLHInserter::new(self.func, self.isa, &mut stats);
                 for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
                     // use SLH on every source
                     slh_inserter.apply_slh_to_bnode(&blade_graph.node_to_bladenode_map[&source]);
                 }
             }
             BladeType::Lfence | BladeType::LfencePerBlock | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
-                let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut fence_counts);
+                let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut stats);
                 for cut_edge in blade_graph.min_cut() {
                     let edge_src = blade_graph.graph.src(cut_edge);
                     let edge_snk = blade_graph.graph.snk(cut_edge);
@@ -257,7 +257,7 @@ impl<'a> BladePass<'a> {
                 }
             }
             BladeType::Slh => {
-                let mut slh_inserter = SLHInserter::new(self.func, self.isa, &mut fence_counts);
+                let mut slh_inserter = SLHInserter::new(self.func, self.isa, &mut stats);
                 for cut_edge in blade_graph.min_cut() {
                     let edge_src = blade_graph.graph.src(cut_edge);
                     let edge_snk = blade_graph.graph.snk(cut_edge);
@@ -281,7 +281,7 @@ impl<'a> BladePass<'a> {
             BladeType::None => panic!("Shouldn't reach here with Blade setting None"),
         }
 
-        fence_counts
+        stats
     }
 
     /// `store_values_are_sinks`: if `true`, then the value operand to a store
@@ -442,12 +442,12 @@ impl<'a> BladePass<'a> {
     }
 }
 
-struct FenceCounts {
+struct BladeStats {
     static_fences_inserted: usize,
     static_slhs_inserted: usize,
 }
 
-impl FenceCounts {
+impl BladeStats {
     fn new() -> Self {
         Self {
             static_fences_inserted: 0,
@@ -461,16 +461,16 @@ struct FenceInserter<'a> {
     func: &'a mut Function,
     /// the `BladeType`
     blade_type: BladeType,
-    /// the `FenceCounts` where we record how many fences we're inserting
-    fence_counts: &'a mut FenceCounts,
+    /// the `BladeStats` where we record how many fences we're inserting
+    stats: &'a mut BladeStats,
 }
 
 impl<'a> FenceInserter<'a> {
-    fn new(func: &'a mut Function, blade_type: BladeType, fence_counts: &'a mut FenceCounts) -> Self {
+    fn new(func: &'a mut Function, blade_type: BladeType, stats: &'a mut BladeStats) -> Self {
         Self {
             func,
             blade_type,
-            fence_counts,
+            stats,
         }
     }
 
@@ -481,12 +481,12 @@ impl<'a> FenceInserter<'a> {
                     match self.blade_type {
                         BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                             // cut at this value by putting lfence before `inst`
-                            insert_fence_before_inst(self.func, inst, self.fence_counts);
+                            insert_fence_before_inst(self.func, inst, self.stats);
                         }
                         BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                             // just put one fence at the beginning of the block.
                             // this stops speculation due to branch mispredictions.
-                            insert_fence_at_beginning_of_block(self.func, inst, self.fence_counts);
+                            insert_fence_at_beginning_of_block(self.func, inst, self.stats);
                         }
                         _ => panic!(
                             "This function didn't expect to be called with blade_type {:?}",
@@ -501,19 +501,19 @@ impl<'a> FenceInserter<'a> {
                         .layout
                         .first_inst(block)
                         .expect("block has no instructions");
-                    insert_fence_before_inst(self.func, first_inst, self.fence_counts);
+                    insert_fence_before_inst(self.func, first_inst, self.stats);
                 }
             },
             BladeNode::Sink(inst) => {
                 match self.blade_type {
                     BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                         // cut at this instruction by putting lfence before it
-                        insert_fence_before_inst(self.func, *inst, self.fence_counts);
+                        insert_fence_before_inst(self.func, *inst, self.stats);
                     }
                     BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                         // just put one fence at the beginning of the block.
                         // this stops speculation due to branch mispredictions.
-                        insert_fence_at_beginning_of_block(self.func, *inst, self.fence_counts);
+                        insert_fence_at_beginning_of_block(self.func, *inst, self.stats);
                     }
                     _ => panic!(
                         "This function didn't expect to be called with blade_type {:?}",
@@ -531,12 +531,12 @@ impl<'a> FenceInserter<'a> {
                     match self.blade_type {
                         BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                             // cut at this value by putting lfence after `inst`
-                            insert_fence_after_inst(self.func, inst, self.fence_counts);
+                            insert_fence_after_inst(self.func, inst, self.stats);
                         }
                         BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                             // just put one fence at the beginning of the block.
                             // this stops speculation due to branch mispredictions.
-                            insert_fence_at_beginning_of_block(self.func, inst, self.fence_counts);
+                            insert_fence_at_beginning_of_block(self.func, inst, self.stats);
                         }
                         _ => panic!(
                             "This function didn't expect to be called with blade_type {:?}",
@@ -551,7 +551,7 @@ impl<'a> FenceInserter<'a> {
                         .layout
                         .first_inst(block)
                         .expect("block has no instructions");
-                    insert_fence_before_inst(self.func, first_inst, self.fence_counts);
+                    insert_fence_before_inst(self.func, first_inst, self.stats);
                 }
             },
             BladeNode::Sink(_) => panic!("Fencing after a sink instruction"),
@@ -560,7 +560,7 @@ impl<'a> FenceInserter<'a> {
 }
 
 /// Primitive that literally inserts a fence before an `Inst`.
-fn insert_fence_before_inst(func: &mut Function, inst: Inst, fence_counts: &mut FenceCounts) {
+fn insert_fence_before_inst(func: &mut Function, inst: Inst, stats: &mut BladeStats) {
     if func.pre_lfence[inst] {
         // do nothing, already had a fence here
     } else {
@@ -568,12 +568,12 @@ fn insert_fence_before_inst(func: &mut Function, inst: Inst, fence_counts: &mut 
             println!("inserting fence before instruction {:?}", func.dfg[inst]);
         }
         func.pre_lfence[inst] = true;
-        fence_counts.static_fences_inserted += 1;
+        stats.static_fences_inserted += 1;
     }
 }
 
 /// Primitive that literally inserts a fence after an `Inst`.
-fn insert_fence_after_inst(func: &mut Function, inst: Inst, fence_counts: &mut FenceCounts) {
+fn insert_fence_after_inst(func: &mut Function, inst: Inst, stats: &mut BladeStats) {
     if func.post_lfence[inst] {
         // do nothing, already had a fence here
     } else {
@@ -581,7 +581,7 @@ fn insert_fence_after_inst(func: &mut Function, inst: Inst, fence_counts: &mut F
             println!("inserting fence after instruction {:?}", func.dfg[inst]);
         }
         func.post_lfence[inst] = true;
-        fence_counts.static_fences_inserted += 1;
+        stats.static_fences_inserted += 1;
     }
 }
 
@@ -625,9 +625,9 @@ fn get_first_inst_of_linear_block(func: &Function, inst: Inst) -> Inst {
 /// Inserts a fence at the beginning of the _linear block_ containing the given
 /// instruction. See notes on `get_first_inst_of_linear_block()`, describing how
 /// we define linear blocks.
-fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, fence_counts: &mut FenceCounts) {
+fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, stats: &mut BladeStats) {
     let top_linear_block = get_first_inst_of_linear_block(func, inst);
-    insert_fence_before_inst(func, top_linear_block, fence_counts);
+    insert_fence_before_inst(func, top_linear_block, stats);
 }
 
 /// Is there a fence at the beginning of the linear block containing the given
@@ -645,18 +645,18 @@ struct SLHInserter<'a> {
     isa: &'a dyn TargetIsa,
     /// tracks which `BladeNode`s have already had SLH applied to them
     bladenodes_done: HashSet<BladeNode>,
-    /// the `FenceCounts` where we record how many SLHs we're inserting
-    fence_counts: &'a mut FenceCounts,
+    /// the `BladeStats` where we record how many SLHs we're inserting
+    stats: &'a mut BladeStats,
 }
 
 impl<'a> SLHInserter<'a> {
     /// A blank SLHInserter
-    fn new(func: &'a mut Function, isa: &'a dyn TargetIsa, fence_counts: &'a mut FenceCounts) -> Self {
+    fn new(func: &'a mut Function, isa: &'a dyn TargetIsa, stats: &'a mut BladeStats) -> Self {
         Self {
             func,
             isa,
             bladenodes_done: HashSet::new(),
-            fence_counts,
+            stats,
         }
     }
 
@@ -664,7 +664,7 @@ impl<'a> SLHInserter<'a> {
     fn apply_slh_to_bnode(&mut self, bnode: &BladeNode) {
         if self.bladenodes_done.insert(bnode.clone()) {
             _apply_slh_to_bnode(self.func, self.isa, bnode);
-            self.fence_counts.static_slhs_inserted += 1;
+            self.stats.static_slhs_inserted += 1;
         }
     }
 }
