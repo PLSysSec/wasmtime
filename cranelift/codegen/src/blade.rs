@@ -28,6 +28,9 @@ pub(crate) const FAKE_SLH_ARRAY_LENGTH_BYTES: u32 = 2345;
 /// Dump (to stdout) the Cranelift IR for each function before this pass
 const DEBUG_PRINT_FUNCTION_BEFORE: bool = false;
 /// Dump (to stdout) the Cranelift IR for each function after this pass
+///
+/// Note that the fences Blade inserts are not (currently) visible in the dumped
+/// Cranelift IR
 const DEBUG_PRINT_FUNCTION_AFTER: bool = false;
 
 /// Print the detailed location of each fence/SLH as we insert it
@@ -42,6 +45,10 @@ const DEBUG_PRINT_SOURCES: bool = false;
 
 /// Should we print various statistics about Blade's actions
 const PRINT_BLADE_STATS: bool = true;
+
+/// Should we dump various statistics about Blade's actions, in JSON form, to a
+/// file <func_name>.json
+const DUMP_BLADE_STATS: bool = true;
 
 pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph) {
     let blade_type = isa.flags().blade_type();
@@ -79,6 +86,24 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         }
         println!("  number of sources in the Blade graph: {}", stats.num_sources);
         println!("  number of sinks in the Blade graph: {}", stats.num_sinks);
+    }
+
+    if DUMP_BLADE_STATS {
+        let json_object = json::object! {
+            static_fences_inserted: stats.static_fences_inserted,
+            static_slhs_inserted: stats.static_slhs_inserted,
+            num_sources: stats.num_sources,
+            num_sinks: stats.num_sinks,
+            static_fences_inserted_due_to_bc_calling_conventions: stats.static_fences_inserted_due_to_bc_calling_conventions,
+        };
+        use std::path::Path;
+        let dir = Path::new("blade_stats");
+        std::fs::create_dir_all(dir).unwrap();
+        let filename = format!("{}.json", func.name);
+        let filepath = dir.join(filename);
+        use std::io::Write;
+        let mut f = std::fs::File::create(filepath).unwrap();
+        writeln!(f, "{:#}", json_object).unwrap();
     }
 }
 
