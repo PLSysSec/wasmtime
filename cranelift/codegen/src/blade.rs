@@ -62,11 +62,14 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
     if PRINT_BLADE_STATS {
         match blade_type {
             BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
-                println!("function {}: inserted {} (static) lfences", func.name, stats.static_fences_inserted);
+                println!("function {}:\n  inserted {} (static) lfences", func.name, stats.static_fences_inserted);
+                if is_switchblade(&blade_type) {
+                    println!("  ({} due to BC calling conventions)", stats.static_fences_inserted_due_to_bc_calling_conventions);
+                }
                 assert_eq!(stats.static_slhs_inserted, 0);
             }
             BladeType::Slh | BladeType::BaselineSlh => {
-                println!("function {}: inserted {} (static) SLHs", func.name, stats.static_slhs_inserted);
+                println!("function {}:\n  inserted {} (static) SLHs", func.name, stats.static_slhs_inserted);
                 assert_eq!(stats.static_fences_inserted, 0);
             }
             BladeType::None => {
@@ -74,6 +77,18 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
                 assert_eq!(stats.static_slhs_inserted, 0);
             }
         }
+        println!("  number of sources in the Blade graph: {}", stats.num_sources);
+        println!("  number of sinks in the Blade graph: {}", stats.num_sinks);
+    }
+}
+
+/// Returns `true` if the blade type is one of the Switchblade types
+fn is_switchblade(blade_type: &BladeType) -> bool {
+    match blade_type {
+        BladeType::SwitchbladeFenceA => true,
+        BladeType::SwitchbladeFenceB => true,
+        BladeType::SwitchbladeFenceC => true,
+        _ => false,
     }
 }
 
@@ -121,12 +136,7 @@ impl<'a> BladePass<'a> {
 
     /// Returns `true` if the blade type is one of the Switchblade types
     fn is_switchblade(&self) -> bool {
-        match self.blade_type {
-            BladeType::SwitchbladeFenceA => true,
-            BladeType::SwitchbladeFenceB => true,
-            BladeType::SwitchbladeFenceC => true,
-            _ => false,
-        }
+        is_switchblade(&self.blade_type)
     }
 
     fn get_def_use_graph_no_call_edges(&self) -> Ref<DefUseGraph> {
@@ -201,6 +211,9 @@ impl<'a> BladePass<'a> {
             for inst in insts_needing_fences {
                 fence_inserter.insert_fence_before(&BladeNode::Sink(inst));
             }
+            // so far, all the fences we've inserted are due to BC calling conventions; and we
+            // won't insert any more due to BC calling conventions
+            stats.static_fences_inserted_due_to_bc_calling_conventions = stats.static_fences_inserted;
         }
 
         // build the Blade graph
@@ -223,18 +236,21 @@ impl<'a> BladePass<'a> {
         };
         let blade_graph = self.build_blade_graph(store_values_are_sinks, sources);
 
+        stats.num_sources = blade_graph.source_nodes().count();
+        stats.num_sinks = blade_graph.sink_nodes().count();
+
         // insert the fences / SLHs
         match self.blade_type {
             BladeType::BaselineFence => {
                 let mut fence_inserter = FenceInserter::new(self.func, self.blade_type, &mut stats);
-                for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
+                for source in blade_graph.source_nodes() {
                     // insert a fence after every source
                     fence_inserter.insert_fence_after(&blade_graph.node_to_bladenode_map[&source]);
                 }
             }
             BladeType::BaselineSlh => {
                 let mut slh_inserter = SLHInserter::new(self.func, self.isa, &mut stats);
-                for source in blade_graph.graph.nodes().filter(|&node| blade_graph.is_source_node(node)) {
+                for source in blade_graph.source_nodes() {
                     // use SLH on every source
                     slh_inserter.apply_slh_to_bnode(&blade_graph.node_to_bladenode_map[&source]);
                 }
@@ -443,8 +459,16 @@ impl<'a> BladePass<'a> {
 }
 
 struct BladeStats {
+    /// Total number of static fences inserted by Blade
     static_fences_inserted: usize,
+    /// Total number of static SLHs inserted by Blade
     static_slhs_inserted: usize,
+    /// Total number of source nodes in the Blade graph
+    num_sources: usize,
+    /// Total number of sink nodes in the Blade graph
+    num_sinks: usize,
+    /// How many of Blade's static fences were inserted during the BC-calling-conventions pass
+    static_fences_inserted_due_to_bc_calling_conventions: usize,
 }
 
 impl BladeStats {
@@ -452,6 +476,9 @@ impl BladeStats {
         Self {
             static_fences_inserted: 0,
             static_slhs_inserted: 0,
+            num_sources: 0,
+            num_sinks: 0,
+            static_fences_inserted_due_to_bc_calling_conventions: 0,
         }
     }
 }
@@ -926,6 +953,24 @@ impl BladeGraph {
     fn is_source_node(&self, node: Node<usize>) -> bool {
         self.graph.inedges(node).any(|(_, incoming)| incoming == self.source_node)
     }
+
+    /// Is the given `Node` a "sink node" in the graph, where "sink node" is
+    /// here defined as any node which has an edge to the global sink node
+    fn is_sink_node(&self, node: Node<usize>) -> bool {
+        self.graph.outedges(node).any(|(_, outgoing)| outgoing == self.sink_node)
+    }
+
+    /// Iterate over the "source nodes" in the graph (for the `is_source_node`
+    /// sense of "source node")
+    fn source_nodes<'s>(&'s self) -> impl Iterator<Item = Node<usize>> + 's {
+        self.graph.nodes().filter(move |&node| self.is_source_node(node))
+    }
+
+    /// Iterate over the "sink nodes" in the graph (for the `is_sink_node`
+    /// sense of "sink node")
+    fn sink_nodes<'s>(&'s self) -> impl Iterator<Item = Node<usize>> + 's {
+        self.graph.nodes().filter(move |&node| self.is_sink_node(node))
+    }
 }
 
 /// `SimpleCache` borrowed from the implementation in the crate
@@ -1027,7 +1072,7 @@ impl BCData {
                     }
                 }
             }
-            if blade_type == BladeType::SwitchbladeFenceA || blade_type == BladeType::SwitchbladeFenceB || blade_type == BladeType::SwitchbladeFenceC {
+            if is_switchblade(&blade_type) {
                 // If needed, based on the calling convention, we mark function
                 // parameters and/or results of call instructions as BC roots.
                 match switchblade_callconv {
