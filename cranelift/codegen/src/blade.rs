@@ -44,11 +44,17 @@ const DEBUG_PRINT_BC_NODES: bool = false;
 const DEBUG_PRINT_SOURCES: bool = false;
 
 /// Should we print various statistics about Blade's actions
-const PRINT_BLADE_STATS: bool = true;
+///
+/// Even if this is set to `false` here, you can enable it by setting the
+/// environment variable `PRINT_BLADE_STATS`
+const PRINT_BLADE_STATS: bool = false;
 
 /// Should we dump various statistics about Blade's actions, in JSON form, to a
-/// file <func_name>.json
-const DUMP_BLADE_STATS: bool = true;
+/// file blade_stats/<func_name>.json
+///
+/// Even if this is set to `false` here, you can enable it by setting the
+/// environment variable `DUMP_BLADE_STATS`
+const DUMP_BLADE_STATS: bool = false;
 
 pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph) {
     let blade_type = isa.flags().blade_type();
@@ -66,7 +72,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         println!("Function after blade:\n{}", func.display(isa));
     }
 
-    if PRINT_BLADE_STATS {
+    if PRINT_BLADE_STATS || std::env::var("PRINT_BLADE_STATS").is_ok() {
         match blade_type {
             BladeType::Lfence | BladeType::LfencePerBlock | BladeType::BaselineFence | BladeType::SwitchbladeFenceA | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                 println!("function {}:\n  inserted {} (static) lfences", func.name, stats.static_fences_inserted);
@@ -88,7 +94,7 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         println!("  number of sinks in the Blade graph: {}", stats.num_sinks);
     }
 
-    if DUMP_BLADE_STATS {
+    if DUMP_BLADE_STATS || std::env::var("DUMP_BLADE_STATS").is_ok() {
         let json_object = json::object! {
             static_fences_inserted: stats.static_fences_inserted,
             static_slhs_inserted: stats.static_slhs_inserted,
