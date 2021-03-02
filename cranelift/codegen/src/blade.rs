@@ -34,7 +34,7 @@ const DEBUG_PRINT_FUNCTION_BEFORE: bool = false;
 /// Dump (to stdout) the Cranelift IR for each function after this pass
 ///
 /// Note that the fences Blade inserts are not (currently) visible in the dumped
-/// Cranelift IR
+/// Cranelift IR; but the SLHs are
 ///
 /// Even if this is set to `false` here, you can enable it by setting the
 /// environment variable `PRINT_FUNCTION_AFTER_BLADE`
