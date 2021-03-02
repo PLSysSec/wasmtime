@@ -896,8 +896,8 @@ impl DefUseGraph {
     }
 
     /// Iterate over all the values which a given `Value` uses
-    pub fn dependents_of_val(&self, val: Value) -> impl Iterator<Item = &Value> {
-        self.inverse_map[val].iter()
+    pub fn dependents_of_val<'s>(&'s self, val: Value) -> impl Iterator<Item = Value> + 's {
+        self.inverse_map[val].iter().copied()
     }
 }
 
@@ -1095,9 +1095,9 @@ impl BCData {
                             // during this step.
                             let contributing_vals = def_use_graph_with_call_edges
                                 .dependents_of_val(val)
-                                .filter(|&v| !value_is_constant(func, *v));
+                                .filter(|&v| !value_is_constant(func, v));
                             for v in contributing_vals {
-                                worklist.push(*v);
+                                worklist.push(v);
                             }
                         }
                     }
