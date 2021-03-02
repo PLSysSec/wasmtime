@@ -26,22 +26,44 @@ pub(crate) const ALLOW_FAKE_SLH_BOUNDS: bool = true;
 pub(crate) const FAKE_SLH_ARRAY_LENGTH_BYTES: u32 = 2345;
 
 /// Dump (to stdout) the Cranelift IR for each function before this pass
+///
+/// Even if this is set to `false` here, you can enable it by setting the
+/// environment variable `PRINT_FUNCTION_BEFORE_BLADE`
 const DEBUG_PRINT_FUNCTION_BEFORE: bool = false;
+
 /// Dump (to stdout) the Cranelift IR for each function after this pass
 ///
 /// Note that the fences Blade inserts are not (currently) visible in the dumped
 /// Cranelift IR
+///
+/// Even if this is set to `false` here, you can enable it by setting the
+/// environment variable `PRINT_FUNCTION_AFTER_BLADE`
 const DEBUG_PRINT_FUNCTION_AFTER: bool = false;
 
 /// Print the detailed location of each fence/SLH as we insert it
+///
+/// Even if this is set to `false` here, you can enable it by setting the
+/// environment variable `PRINT_BLADE_DEF_LOCATIONS`
 const DEBUG_PRINT_DETAILED_DEF_LOCATIONS: bool = false;
 
 /// Print the list of all BC-tainted nodes in the function.
 /// This only has an effect under Switchblade strategies.
+///
+/// Even if this is set to `false` here, you can enable it by setting the
+/// environment variable `PRINT_SWITCHBLADE_BC_NODES`
 const DEBUG_PRINT_BC_NODES: bool = false;
 
 /// Print the list of all sources in the Blade graph.
+///
+/// Even if this is set to `false` here, you can enable it by setting the
+/// environment variable `PRINT_BLADE_SOURCES`
 const DEBUG_PRINT_SOURCES: bool = false;
+
+/// Print the list of all sinks in the Blade graph.
+///
+/// Even if this is set to `false` here, you can enable it by setting the
+/// environment variable `PRINT_BLADE_SINKS`
+const DEBUG_PRINT_SINKS: bool = false;
 
 /// Should we print various statistics about Blade's actions
 ///
@@ -62,13 +84,13 @@ pub fn do_blade(func: &mut Function, isa: &dyn TargetIsa, cfg: &ControlFlowGraph
         return;
     }
 
-    if DEBUG_PRINT_FUNCTION_BEFORE {
+    if DEBUG_PRINT_FUNCTION_BEFORE || std::env::var("PRINT_FUNCTION_BEFORE_BLADE").is_ok() {
         println!("Function before blade:\n{}", func.display(isa));
     }
 
     let stats = BladePass::new(func, cfg, isa).run();
 
-    if DEBUG_PRINT_FUNCTION_AFTER {
+    if DEBUG_PRINT_FUNCTION_AFTER || std::env::var("PRINT_FUNCTION_AFTER_BLADE").is_ok() {
         println!("Function after blade:\n{}", func.display(isa));
     }
 
@@ -203,7 +225,7 @@ impl<'a> BladePass<'a> {
             // Switchblade calling convention)
             let mut insts_needing_fences = vec![];
             let bcdata = self.get_bcdata();
-            if DEBUG_PRINT_BC_NODES {
+            if DEBUG_PRINT_BC_NODES || std::env::var("PRINT_SWITCHBLADE_BC_NODES").is_ok() {
                 println!("BC-tainted nodes: {:?}", bcdata.tainted_values.keys().filter(|&val| bcdata.tainted_values.contains(val)).collect::<Vec<Value>>());
             }
             for block in self.func.layout.blocks() {
@@ -266,6 +288,15 @@ impl<'a> BladePass<'a> {
             (_, true) => Sources::AllLoads,
         };
         let blade_graph = self.build_blade_graph(store_values_are_sinks, sources);
+
+        if DEBUG_PRINT_SOURCES || std::env::var("PRINT_BLADE_SOURCES").is_ok() {
+            let sources: Vec<Value> = blade_graph.source_values().collect();
+            println!("Blade sources: {:?}", sources);
+        }
+        if DEBUG_PRINT_SINKS || std::env::var("PRINT_BLADE_SINKS").is_ok() {
+            let sinks: Vec<&BladeNode> = blade_graph.sink_bladenodes().collect();
+            println!("Blade sinks: {:?}", sinks);
+        }
 
         stats.num_sources = blade_graph.source_nodes().count();
         stats.num_sinks = blade_graph.sink_nodes().count();
@@ -521,6 +552,8 @@ struct FenceInserter<'a> {
     blade_type: BladeType,
     /// the `BladeStats` where we record how many fences we're inserting
     stats: &'a mut BladeStats,
+    /// if `true`, then we print (to stdout) the location of each fence as we insert it
+    verbose: bool,
 }
 
 impl<'a> FenceInserter<'a> {
@@ -529,6 +562,7 @@ impl<'a> FenceInserter<'a> {
             func,
             blade_type,
             stats,
+            verbose: DEBUG_PRINT_DETAILED_DEF_LOCATIONS || std::env::var("PRINT_BLADE_DEF_LOCATIONS").is_ok(),
         }
     }
 
@@ -539,12 +573,12 @@ impl<'a> FenceInserter<'a> {
                     match self.blade_type {
                         BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                             // cut at this value by putting lfence before `inst`
-                            insert_fence_before_inst(self.func, inst, self.stats);
+                            insert_fence_before_inst(self.func, inst, self.stats, self.verbose);
                         }
                         BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                             // just put one fence at the beginning of the block.
                             // this stops speculation due to branch mispredictions.
-                            insert_fence_at_beginning_of_block(self.func, inst, self.stats);
+                            insert_fence_at_beginning_of_block(self.func, inst, self.stats, self.verbose);
                         }
                         _ => panic!(
                             "This function didn't expect to be called with blade_type {:?}",
@@ -559,19 +593,19 @@ impl<'a> FenceInserter<'a> {
                         .layout
                         .first_inst(block)
                         .expect("block has no instructions");
-                    insert_fence_before_inst(self.func, first_inst, self.stats);
+                    insert_fence_before_inst(self.func, first_inst, self.stats, self.verbose);
                 }
             },
             BladeNode::Sink(inst) => {
                 match self.blade_type {
                     BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                         // cut at this instruction by putting lfence before it
-                        insert_fence_before_inst(self.func, *inst, self.stats);
+                        insert_fence_before_inst(self.func, *inst, self.stats, self.verbose);
                     }
                     BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                         // just put one fence at the beginning of the block.
                         // this stops speculation due to branch mispredictions.
-                        insert_fence_at_beginning_of_block(self.func, *inst, self.stats);
+                        insert_fence_at_beginning_of_block(self.func, *inst, self.stats, self.verbose);
                     }
                     _ => panic!(
                         "This function didn't expect to be called with blade_type {:?}",
@@ -589,12 +623,12 @@ impl<'a> FenceInserter<'a> {
                     match self.blade_type {
                         BladeType::Lfence | BladeType::BaselineFence | BladeType::SwitchbladeFenceA => {
                             // cut at this value by putting lfence after `inst`
-                            insert_fence_after_inst(self.func, inst, self.stats);
+                            insert_fence_after_inst(self.func, inst, self.stats, self.verbose);
                         }
                         BladeType::LfencePerBlock | BladeType::SwitchbladeFenceB | BladeType::SwitchbladeFenceC => {
                             // just put one fence at the beginning of the block.
                             // this stops speculation due to branch mispredictions.
-                            insert_fence_at_beginning_of_block(self.func, inst, self.stats);
+                            insert_fence_at_beginning_of_block(self.func, inst, self.stats, self.verbose);
                         }
                         _ => panic!(
                             "This function didn't expect to be called with blade_type {:?}",
@@ -609,7 +643,7 @@ impl<'a> FenceInserter<'a> {
                         .layout
                         .first_inst(block)
                         .expect("block has no instructions");
-                    insert_fence_before_inst(self.func, first_inst, self.stats);
+                    insert_fence_before_inst(self.func, first_inst, self.stats, self.verbose);
                 }
             },
             BladeNode::Sink(_) => panic!("Fencing after a sink instruction"),
@@ -618,11 +652,11 @@ impl<'a> FenceInserter<'a> {
 }
 
 /// Primitive that literally inserts a fence before an `Inst`.
-fn insert_fence_before_inst(func: &mut Function, inst: Inst, stats: &mut BladeStats) {
+fn insert_fence_before_inst(func: &mut Function, inst: Inst, stats: &mut BladeStats, verbose: bool) {
     if func.pre_lfence[inst] {
         // do nothing, already had a fence here
     } else {
-        if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+        if verbose {
             println!("inserting fence before instruction {:?}", func.dfg[inst]);
         }
         func.pre_lfence[inst] = true;
@@ -631,11 +665,11 @@ fn insert_fence_before_inst(func: &mut Function, inst: Inst, stats: &mut BladeSt
 }
 
 /// Primitive that literally inserts a fence after an `Inst`.
-fn insert_fence_after_inst(func: &mut Function, inst: Inst, stats: &mut BladeStats) {
+fn insert_fence_after_inst(func: &mut Function, inst: Inst, stats: &mut BladeStats, verbose: bool) {
     if func.post_lfence[inst] {
         // do nothing, already had a fence here
     } else {
-        if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+        if verbose {
             println!("inserting fence after instruction {:?}", func.dfg[inst]);
         }
         func.post_lfence[inst] = true;
@@ -683,9 +717,9 @@ fn get_first_inst_of_linear_block(func: &Function, inst: Inst) -> Inst {
 /// Inserts a fence at the beginning of the _linear block_ containing the given
 /// instruction. See notes on `get_first_inst_of_linear_block()`, describing how
 /// we define linear blocks.
-fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, stats: &mut BladeStats) {
+fn insert_fence_at_beginning_of_block(func: &mut Function, inst: Inst, stats: &mut BladeStats, verbose: bool) {
     let top_linear_block = get_first_inst_of_linear_block(func, inst);
-    insert_fence_before_inst(func, top_linear_block, stats);
+    insert_fence_before_inst(func, top_linear_block, stats, verbose);
 }
 
 /// Is there a fence at the beginning of the linear block containing the given
@@ -705,6 +739,8 @@ struct SLHInserter<'a> {
     bladenodes_done: HashSet<BladeNode>,
     /// the `BladeStats` where we record how many SLHs we're inserting
     stats: &'a mut BladeStats,
+    /// if `true`, then we print (to stdout) the location of each SLH as we insert it
+    verbose: bool,
 }
 
 impl<'a> SLHInserter<'a> {
@@ -715,19 +751,20 @@ impl<'a> SLHInserter<'a> {
             isa,
             bladenodes_done: HashSet::new(),
             stats,
+            verbose: DEBUG_PRINT_DETAILED_DEF_LOCATIONS || std::env::var("PRINT_BLADE_DEF_LOCATIONS").is_ok(),
         }
     }
 
     /// Apply SLH to `bnode`, but only if we haven't already applied SLH to `bnode`
     fn apply_slh_to_bnode(&mut self, bnode: &BladeNode) {
         if self.bladenodes_done.insert(bnode.clone()) {
-            _apply_slh_to_bnode(self.func, self.isa, bnode);
+            _apply_slh_to_bnode(self.func, self.isa, bnode, self.verbose);
             self.stats.static_slhs_inserted += 1;
         }
     }
 }
 
-fn _apply_slh_to_bnode(func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNode) {
+fn _apply_slh_to_bnode(func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNode, verbose: bool) {
     match bnode {
         BladeNode::Sink(_) => panic!("Can't do SLH to protect a sink, have to protect a source"),
         BladeNode::ValueDef(value) => {
@@ -735,7 +772,7 @@ fn _apply_slh_to_bnode(func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNo
             match func.dfg.value_def(*value) {
                 ValueDef::Param(_, _) => unimplemented!("SLH on a block parameter"),
                 ValueDef::Result(inst, _) => {
-                    apply_slh_to_load_inst(func, isa, inst);
+                    apply_slh_to_load_inst(func, isa, inst, verbose);
                 }
             }
         }
@@ -743,9 +780,9 @@ fn _apply_slh_to_bnode(func: &mut Function, isa: &dyn TargetIsa, bnode: &BladeNo
 }
 
 /// Expects `inst` to be a load instruction, and panics if it is not
-fn apply_slh_to_load_inst(func: &mut Function, isa: &dyn TargetIsa, inst: Inst) {
+fn apply_slh_to_load_inst(func: &mut Function, isa: &dyn TargetIsa, inst: Inst, verbose: bool) {
     assert!(func.dfg[inst].opcode().can_load(), "SLH on a non-load instruction: {:?}", func.dfg[inst]);
-    if DEBUG_PRINT_DETAILED_DEF_LOCATIONS {
+    if verbose {
         println!("applying SLH to this load: {:?}", func.dfg[inst]);
     }
     let mut cur = EncCursor::new(func, isa).at_inst(inst);
@@ -931,6 +968,15 @@ enum BladeNode {
     Sink(Inst),
 }
 
+impl BladeNode {
+    fn unwrap_value(&self) -> Value {
+        match self {
+            Self::ValueDef(v) => *v,
+            Self::Sink(_) => panic!("unwrap_value: not a value"),
+        }
+    }
+}
+
 impl BladeGraph {
     /// Return the cut-edges in the mincut of the graph
     fn min_cut(&self) -> Vec<Edge<usize>> {
@@ -997,10 +1043,24 @@ impl BladeGraph {
         self.graph.nodes().filter(move |&node| self.is_source_node(node))
     }
 
+    /// `source_nodes()`, but returns `Value`s instead of `Node`s
+    fn source_values<'s>(&'s self) -> impl Iterator<Item = Value> + 's {
+        self.graph.nodes()
+            .filter(move |&node| self.is_source_node(node))
+            .map(move |node| self.node_to_bladenode_map[&node].unwrap_value())  // unwrap_value() is OK because BladeNode::Sink can't be a source
+    }
+
     /// Iterate over the "sink nodes" in the graph (for the `is_sink_node`
     /// sense of "sink node")
     fn sink_nodes<'s>(&'s self) -> impl Iterator<Item = Node<usize>> + 's {
         self.graph.nodes().filter(move |&node| self.is_sink_node(node))
+    }
+
+    /// `sink_nodes()`, but returns `BladeNode`s instead of `Node`s
+    fn sink_bladenodes<'s>(&'s self) -> impl Iterator<Item = &'s BladeNode> + 's {
+        self.graph.nodes()
+            .filter(move |&node| self.is_sink_node(node))
+            .map(move |node| &self.node_to_bladenode_map[&node])
     }
 }
 
@@ -1257,9 +1317,6 @@ impl BladeGraphBuilder {
     fn mark_as_source(&mut self, src: Value) {
         let node = self.bladenode_to_node_map[&BladeNode::ValueDef(src)];
         self.graph.add_edge(self.source_node, node);
-        if DEBUG_PRINT_SOURCES {
-            println!("marked as source: {:?}", src);
-        }
     }
 
     /// Add an edge from the given `Node` to the given `Value`
