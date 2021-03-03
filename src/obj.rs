@@ -25,6 +25,7 @@ pub fn compile_to_obj(
     cache_config: &CacheConfig,
     blade_type: impl AsRef<str>,
     blade_v1_1: bool,
+    blade_conds_arent_sinks: bool,
     switchblade_callconv: impl AsRef<str>,
 ) -> Result<Artifact> {
     let isa_builder = match target {
@@ -55,6 +56,9 @@ pub fn compile_to_obj(
     flag_builder.set("blade_type", blade_type.as_ref()).unwrap();
     if blade_v1_1 {
         flag_builder.enable("blade_v1_1").unwrap();
+    }
+    if blade_conds_arent_sinks {
+        flag_builder.enable("blade_conds_arent_sinks").unwrap();
     }
     flag_builder.set("switchblade_callconv", switchblade_callconv.as_ref()).unwrap();
 

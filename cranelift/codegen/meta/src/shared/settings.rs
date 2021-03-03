@@ -300,6 +300,20 @@ pub(crate) fn define() -> SettingGroup {
         false,
     );
 
+    settings.add_bool(
+        "blade_conds_arent_sinks",
+        r#"
+            If this is false (default), both conditionals and memory addresses
+            are sinks for the Blade algorithm. If this is set to true, then
+            only memory addresses are sinks.
+        "#,
+        // I realize that "blade_conds_are_sinks" would be a more reasonable way
+        // to have this option, but I'm not positive how to handle default-true
+        // boolean flags in various parts of the argument-parsing frontends for
+        // lucet and/or wasmtime
+        false,
+    );
+
     settings.add_enum(
         "switchblade_callconv",
         r#"

@@ -157,6 +157,8 @@ struct BladePass<'a> {
     blade_type: BladeType,
     /// Whether we are also protecting from v1.1 (as opposed to just v1)
     blade_v1_1: bool,
+    /// Whether conditionals are sinks (note that memory addresses are always sinks)
+    conds_are_sinks: bool,
     /// the Switchblade calling convention. (Not used if `blade_type` isn't Switchblade.)
     switchblade_callconv: SwitchbladeCallconv,
     /// The def-use graph for that function, with no call edges (see
@@ -180,6 +182,7 @@ impl<'a> BladePass<'a> {
             isa,
             blade_type: isa.flags().blade_type(),
             blade_v1_1: isa.flags().blade_v1_1(),
+            conds_are_sinks: !isa.flags().blade_conds_arent_sinks(),  // note the inversion
             switchblade_callconv: isa.flags().switchblade_callconv(),
             def_use_graph_no_call_edges: SimpleCache::new(),
             def_use_graph_with_call_edges: SimpleCache::new(),
@@ -469,17 +472,19 @@ impl<'a> BladePass<'a> {
                     };
 
                 } else if op.is_branch() {
-                    // conditional branches are sinks
+                    // conditional branches are sinks, unless we explicitly
+                    // disabled that behavior using the command-line flag
 
-                    let inst_sink_node = builder.add_sink_node_for_inst(inst);
+                    if self.conds_are_sinks {
+                        let inst_sink_node = builder.add_sink_node_for_inst(inst);
 
-                    // blade only does conditional branches but this will handle indirect jumps as well
-                    // `inst_fixed_args` gets the condition args for branches,
-                    //   and ignores the destination block params (which are also included in args)
-                    for &arg in self.func.dfg.inst_fixed_args(inst) {
-                        builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                        // blade only does conditional branches but this will handle indirect jumps as well
+                        // `inst_fixed_args` gets the condition args for branches,
+                        //   and ignores the destination block params (which are also included in args)
+                        for &arg in self.func.dfg.inst_fixed_args(inst) {
+                            builder.add_edge_from_value_to_node(arg, inst_sink_node);
+                        }
                     }
-
                 }
                 if op.is_call() {
                     // to avoid interprocedural analysis, we require that function

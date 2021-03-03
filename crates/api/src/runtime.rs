@@ -399,6 +399,13 @@ impl Config {
         self
     }
 
+    /// Enables the blade_conds_arent_sinks setting to be passed on to Cranelift
+    pub fn blade_conds_arent_sinks(&mut self, blade_conds_arent_sinks: bool) -> &mut Self {
+        let val = if blade_conds_arent_sinks { "true" } else { "false" };
+        self.flags.set("blade_conds_arent_sinks", val).expect("should be valid flag");
+        self
+    }
+
     /// Sets the switchblade_callconv setting to be passed on to Cranelift
     pub fn switchblade_callconv(&mut self, switchblade_callconv: impl AsRef<str>) -> Result<&mut Self> {
         self.flags.set("switchblade_callconv", switchblade_callconv.as_ref())?;

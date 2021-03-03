@@ -149,6 +149,8 @@ struct CommonOptions {
     blade_type: String,
     #[structopt(long)]
     blade_v1_1: bool,
+    #[structopt(long)]
+    blade_conds_arent_sinks: bool,
     #[structopt(long, default_value="not_not")]
     switchblade_callconv: String,
 
@@ -178,6 +180,7 @@ impl CommonOptions {
             .profiler(pick_profiling_strategy(self.jitdump, self.vtune)?)?
             .blade_type(&self.blade_type)?
             .blade_v1_1(self.blade_v1_1)
+            .blade_conds_arent_sinks(self.blade_conds_arent_sinks)
             .switchblade_callconv(&self.switchblade_callconv)?;
         if !self.disable_cache {
             match &self.config {
